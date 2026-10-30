@@ -34,7 +34,19 @@ const opt = (name, def = null) => {
   return i >= 0 ? (argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : true) : def;
 };
 const has = (name) => argv.includes(name);
-const positional = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1].startsWith('--') && argv[i - 1] !== '--platform' && argv[i - 1] !== '--out'));
+// 位置参数 = 既不是 `--xxx`、也不是某个选项的取值。
+// ⚠️ 旧实现把「--platform 的取值」也算成位置参数，于是文档里的
+//    `build.mjs --platform win <项目根>` 会把 `win` 当成项目根 → chdir 到 <cwd>/win 失败。
+const VALUE_FLAGS = new Set(['--platform', '--out', '--name-prefix']);
+const positional = [];
+for (let i = 0; i < argv.length; i += 1) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+    if (VALUE_FLAGS.has(a) && argv[i + 1] && !argv[i + 1].startsWith('--')) i += 1;
+    continue;
+  }
+  positional.push(a);
+}
 
 const PLATFORM = opt('--platform', 'mac');
 const ROOT = path.resolve(positional[0] || process.cwd());
@@ -48,6 +60,26 @@ const ok = (s) => console.log(`${C.g}✓${C.x} ${s}`);
 const bad = (s) => console.log(`${C.r}✗${C.x} ${s}`);
 const warn = (s) => console.log(`${C.y}!${C.x} ${s}`);
 const dim = (s) => console.log(`${C.d}  ${s}${C.x}`);
+
+const IS_WIN = process.platform === 'win32';
+
+/**
+ * 跨平台执行 npm / npx。
+ *
+ * Windows 上 npm 实际是 `npm.cmd`：`spawnSync('npm', [...], {shell:false})` 会直接 ENOENT
+ * （libuv 只补 `.exe`，不认 PATHEXT）；而 Node ≥18.20 出于 CVE-2024-27980 又禁止
+ * 无 shell 执行 `.cmd`。所以 Windows 必须 `shell: true`。
+ * 代价：shell 模式下 Node 只是把 args 用空格拼接、不自动加引号，
+ * 带空格的参数必须自己包引号（本脚本传入的都是脚本名/flag，无空格）。
+ */
+function runTool(cmd, args, opts = {}) {
+  if (IS_WIN) {
+    const bin = cmd === 'npm' ? 'npm.cmd' : cmd === 'npx' ? 'npx.cmd' : cmd;
+    return spawnSync(bin, args, { shell: true, windowsHide: true, ...opts });
+  }
+  return spawnSync(cmd, args, opts);
+}
+
 
 process.chdir(ROOT);
 
@@ -201,7 +233,7 @@ function runTests() {
   if (SKIP_TESTS) { warn('SKIP_TESTS，跳过单元测试'); return true; }
   if (!pkg.scripts?.test) { dim('项目无 test 脚本，跳过'); return true; }
   log('运行单元测试');
-  const r = spawnSync('npm', ['test'], { encoding: 'utf8', shell: false });
+  const r = runTool('npm', ['test'], { encoding: 'utf8' });
   const out = (r.stdout || '') + (r.stderr || '');
   const m = /#\s*pass\s+(\d+)/.exec(out);
   const f = /#\s*fail\s+(\d+)/.exec(out);
@@ -215,23 +247,179 @@ function runTests() {
 }
 
 // ---------- 步骤3：构建 ----------
+/** 执行构建命令，返回 { ok, out, via } */
 function doBuild(plan) {
   log(`构建：${plan.via}`);
   const env = { ...process.env };
   // WorkBuddy 沙箱会打断 asar 写入（Brokered file token refused），必须剥掉
   if (env.NODE_OPTIONS) { delete env.NODE_OPTIONS; dim('已剥离 NODE_OPTIONS（沙箱 shim 会打断 asar 写入）'); }
 
-  const r = spawnSync(plan.cmd, plan.args, { encoding: 'utf8', env, shell: false });
-  const out = ((r.stdout || '') + (r.stderr || '')).trim();
+  const r = runTool(plan.cmd, plan.args, { encoding: 'utf8', env });
+  // spawn 自身失败（ENOENT / EACCES）时 stdout/stderr 都是空的，必须把 r.error 带上，
+  // 否则报错信息为空、兜底判定也无从命中（表现为「构建失败 + 一片空白」）。
+  const out = ((r.stdout || '') + (r.stderr || '') + (r.error ? `\n${r.error.code || 'SPAWN_ERROR'} ${r.error.message}` : '')).trim();
   if (r.status !== 0) {
-    bad('构建失败，末尾输出：');
-    console.log(out.split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
-    return false;
+    return { ok: false, out, via: plan.via, cmd: plan.cmd, spawnError: r.error?.code || null };
   }
   for (const line of out.split('\n')) {
     if (/building\s+target|skipped macOS code signing|packaging\s+platform|building block map/.test(line)) {
       dim('  ' + line.trim());
     }
+  }
+  return { ok: true, out, via: plan.via };
+}
+
+/** 直接调用项目内的 electron-builder CLI（绕过 .bin shim） */
+function localBuilderCli() {
+  const p = path.join(ROOT, 'node_modules', 'electron-builder', 'cli.js');
+  return fs.existsSync(p) ? p : null;
+}
+
+// ---------- 步骤3.5：Windows 打包的两个本机兜底 ----------
+
+/**
+ * 兜底 1：`.bin` shim 不可用。
+ *
+ * 典型场景：node_modules 从 macOS / 另一台机器整体拷贝过来。此时
+ *   - `node_modules/.bin/` 里没有 `.cmd` / `.ps1` shim（Windows 解析不到）
+ *   - `node_modules/electron/dist/electron.exe` 也不存在
+ * 于是 `npm run build:win` 报「electron-builder 不是内部或外部命令」，
+ * `npm start` / `npx electron-builder` 同样失效。可直接用 node 调 cli.js 绕过。
+ *
+ * ⚠️ 只认「shim 缺失」这一类信号。**不能**把 `Cannot find module` 也算进来：
+ *   项目自身的 `vite build` 因缺模块失败时会被误判，随后直接跑 electron-builder
+ *   把上一次的旧产物打进安装包，收尾与校验还会全部通过 —— 静默发旧版本。
+ */
+const SHIM_FAILURE = /不是内部或外部命令|is not recognized as an internal or external command|Missing script/i;
+
+function shouldFallbackToCli(res) {
+  if (!res || !['npm', 'npx'].includes(res.cmd)) return false;
+  if (res.spawnError === 'ENOENT' || res.spawnError === 'EACCES') return true;
+  return SHIM_FAILURE.test(res.out || '');
+}
+
+function buildWithNodeCli(summary) {
+  const cli = localBuilderCli();
+  if (!cli) {
+    bad('项目内找不到 node_modules/electron-builder/cli.js，无法回退');
+    return null;
+  }
+  warn(`npm 脚本不可用（${summary}），回退到 node cli.js`);
+  const flags = PLATFORM === 'all' ? [] : [`--${PLATFORM}`];
+  const args = [cli, ...flags, '--publish', 'never'];
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+  const out = ((r.stdout || '') + (r.stderr || '')).trim();
+  return { ok: r.status === 0, out, via: `node cli.js ${args.slice(1).join(' ')}` };
+}
+
+/**
+ * 兜底 2：rcedit `Unable to commit changes`。
+ *
+ * 现象：打包到「写 exe 版本信息 / 图标」阶段必失败一次，报
+ *   `Fatal error: Unable to commit changes`（来自 EndUpdateResourceW）。
+ * 根因：刚拷出的 exe（几十~两百 MB）被实时防护（火绒 / 电脑管家 / Defender）
+ *   瞬时独占，等 8~30 秒后同一命令必成功。electron-builder 内置 3 次重试间隔太短。
+ * 处置：从日志里抠出**原始命令行**（不硬编码品牌信息，参数按单引号分段以兼容中文/空格路径），
+ *   退避重写元数据；再用 `--prepackaged <win-unpacked>` 只补跑分发目标 ——
+ *   整包重跑会重新拷贝 exe，必然再次触发锁定。
+ */
+function extractRceditCommand(out) {
+  const lines = out.split(/\r?\n/);
+  let start = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (/command='.*rcedit.*'/i.test(lines[i])) { start = i; break; }
+  }
+  if (start < 0) return null;
+  // builder 偶尔把超长命令行折行渲染（续行以缩进 + `--xxx` 开头），一并拼回
+  let s = lines[start];
+  for (let j = start + 1; j < lines.length; j += 1) {
+    if (/^\s{4,}--/.test(lines[j])) s += ' ' + lines[j].trim();
+    else break;
+  }
+  s = s.replace(/^\s*command=/, '');
+  const toks = [];
+  let cur = '';
+  let inQuote = false;
+  for (const ch of s) {
+    if (ch === "'") {
+      if (inQuote) {
+        toks.push(cur);
+        cur = '';
+        inQuote = false;
+      } else {
+        if (cur.trim()) toks.push(cur.trim());
+        cur = '';
+        inQuote = true;
+      }
+    } else if (!inQuote && /\s/.test(ch)) {
+      if (cur.trim()) toks.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim()) toks.push(cur.trim());
+  return toks.length > 1 ? toks : null;
+}
+
+/** 同步休眠（不占 CPU；热自旋会在杀软扫描期间白烧一个核，反而拖慢释放） */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const t = Date.now();
+    while (Date.now() - t < ms) { /* 兜底：极少数环境禁用 SAB */ }
+  }
+}
+
+function patchExeMetadata(cmd) {
+  const exe = cmd[1];
+  // 秒级退避：实时防护的扫描锁通常 8~30s 释放
+  const waits = [0, 8, 8, 10, 12, 15, 20, 25];
+  for (const [i, w] of waits.entries()) {
+    if (w) sleepSync(w * 1000);
+    try {
+      // 先确认目标未被独占写（等价于 rcedit 的前提条件）
+      fs.closeSync(fs.openSync(exe, 'r+'));
+    } catch (e) {
+      dim(`  [${i}] 目标仍被占用（${e.code}），继续等待`);
+      continue;
+    }
+    const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', windowsHide: true });
+    if (r.status === 0) {
+      ok(`rcedit 补写成功（第 ${i + 1} 次尝试）`);
+      return true;
+    }
+    dim(`  [${i}] rcedit 失败：${(r.stderr || r.stdout || '').trim().split('\n').pop()}`);
+  }
+  return false;
+}
+
+function recoverFromRceditLock(out) {
+  const cmd = extractRceditCommand(out);
+  if (!cmd) {
+    bad('未从日志中解析出 rcedit 命令行');
+    return false;
+  }
+  dim(`目标 exe：${cmd[1]}`);
+  if (!patchExeMetadata(cmd)) {
+    bad('rcedit 多次重试仍失败：把项目目录 / 输出目录加入安全软件信任区后重试');
+    return false;
+  }
+  const cli = localBuilderCli();
+  const appOutDir = path.join(OUTPUT_DIR, 'win-unpacked');
+  if (!cli) {
+    bad('找不到 node_modules/electron-builder/cli.js，无法续跑安装包');
+    return false;
+  }
+  log(`续跑分发目标：--prepackaged ${appOutDir}`);
+  const args = [cli, '--win', '--publish', 'never', '--prepackaged', appOutDir];
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+  const o = ((r.stdout || '') + (r.stderr || '')).trim();
+  if (r.status !== 0) {
+    bad('续跑失败，末尾输出：');
+    console.log(o.split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
+    return false;
   }
   return true;
 }
@@ -265,12 +453,35 @@ function finalize(outDir) {
   for (const f of m.files) {
     const src = path.join(OUTPUT_DIR, path.basename(f.url));
     if (!fs.existsSync(src)) { missing.push(path.basename(f.url)); continue; }
-    fs.copyFileSync(src, path.join(outDir, asciiName(path.basename(f.url))));
+    const dest = path.join(outDir, asciiName(path.basename(f.url)));
+    fs.copyFileSync(src, dest);
+    // blockmap 必须与改名后的安装包同名同目录，否则客户端静默退化为全量下载
+    // （latest.yml 不列 blockmap，漏拷不会报错，只会让差量更新失效）
+    const bmSrc = `${src}.blockmap`;
+    if (fs.existsSync(bmSrc)) fs.copyFileSync(bmSrc, `${dest}.blockmap`);
     n++;
   }
   if (missing.length) {
     bad(`清单引用的产物不存在：${missing.join(', ')}`);
     return false;
+  }
+  // Windows 的 latest.yml 只登记 nsis 安装包；win.zip 是「手动分发」用的额外产物，
+  // 一并收齐改名（不写进清单），方便 release 上传时保持 ASCII 命名。
+  // ⚠️ 必须按「本次版本 + 平台」过滤：OUTPUT_DIR 从不清空，跨版本构建后旧 zip
+  //    仍在目录里，无过滤会把历史版本一起收进 package/ 分发出去。
+  if (PLATFORM === 'win') {
+    const zi = fs.readdirSync(OUTPUT_DIR);
+    const allZips = zi.filter((f) => /\.zip$/i.test(f));
+    const mine = allZips.filter((f) => f.includes(VERSION) && /win/i.test(f));
+    for (const f of allZips) {
+      if (!mine.includes(f)) dim(`  跳过非本批次 zip：${f}`);
+    }
+    for (const f of mine) {
+      const dest = path.join(outDir, asciiName(f));
+      if (fs.existsSync(dest)) continue;
+      fs.copyFileSync(path.join(OUTPUT_DIR, f), dest);
+      dim(`  额外收齐（不在清单内）：${path.basename(dest)}`);
+    }
   }
   ok(`已收齐 ${n} 个产物 → ${outDir}/`);
 
@@ -364,7 +575,27 @@ if (!NO_FINALIZE && fs.existsSync(outDir)) {
 }
 
 if (!runTests()) process.exit(1);
-if (!doBuild(plan)) process.exit(3);
+
+let buildRes = doBuild(plan);
+
+// 兜底 1：npm 脚本 / .bin shim 不可用（跨平台拷贝来的 node_modules 常见）
+if (!buildRes.ok && shouldFallbackToCli(buildRes)) {
+  const alt = buildWithNodeCli(buildRes.via);
+  if (alt) buildRes = alt;
+}
+
+// 兜底 2：rcedit 被实时防护瞬时锁定（Windows 必现，等 8~30s 即恢复）
+if (!buildRes.ok && PLATFORM === 'win' && /Unable to commit changes/i.test(buildRes.out)) {
+  bad('rcedit 被实时防护短暂锁定，进入退避补写');
+  if (!recoverFromRceditLock(buildRes.out)) process.exit(3);
+  buildRes = { ok: true, out: '', via: 'prepackaged 续跑' };
+}
+
+if (!buildRes.ok) {
+  bad(`构建失败（${buildRes.via}），末尾输出：`);
+  console.log(buildRes.out.split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
+  process.exit(3);
+}
 
 if (NO_FINALIZE) {
   warn('--no-finalize：跳过收尾与校验');

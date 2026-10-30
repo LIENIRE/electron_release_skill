@@ -207,6 +207,8 @@ const image = {
     productName: build?.productName || null,
     appId: build?.appId || null,
     description: pkg.description || null,
+    // 缺失时 electron-builder 会把 exe CompanyName / NSIS 发布者回落成 "GitHub, Inc."
+    author: typeof pkg.author === 'string' ? pkg.author : pkg.author?.name || null,
   },
   detection: {
     isElectron,
@@ -295,6 +297,7 @@ if (!asJson) {
   console.log(`项目        ${p.name || '(无名)'}  v${p.version}`);
   console.log(`根目录      ${image.project.root}`);
   console.log(`产品名/ID   ${p.productName || '(未声明)'}  /  ${p.appId || '(未声明)'}`);
+  console.log(`发布者      ${p.author || '(未声明) ← exe CompanyName 与卸载项发布者会回落 GitHub, Inc.'}`);
   console.log(`打包工具    ${image.detection.buildTools.join(', ') || '(无)'}`);
   console.log(`配置来源    ${configSource || '(无构建配置)'}`);
   console.log(`目标        ${Object.entries(image.targets).map(([k, v]) => `${k}: ${[].concat(v).join('/')}`).join('  ') || '(未声明)'}`);

@@ -17,7 +17,7 @@
  *   node verify-win-artifact.mjs [--dir release] [--manifest latest.yml]
  *                                [--exe <path>] [--expect-version 1.2.3]
  *                                [--expect-arch x64|arm64|x86] [--json]
- *                                [--max-blockmap-skew 600]
+ *                                [--max-blockmap-skew 600] [--allow-unsigned]
  *
  * 退出码：0 全部通过；1 有失败项；2 参数/环境错误。
  *
@@ -25,12 +25,14 @@
  *   - 不修改任何文件，只读
  *   - 不静默跳过：无法执行的检查标 SKIP 并写明原因，不算通过
  *   - 非 Windows 上无法验 Authenticode 时，优先尝试 osslsigncode，其次 SKIP
+ *   - NSIS 安装包本体恒为 32 位引导程序，架构要看 win-unpacked 里的载荷 exe
  */
 
 import { createHash } from 'node:crypto';
 import { readFile, stat, readdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 // ---------------------------------------------------------------- CLI
@@ -44,6 +46,8 @@ function parseArgs(argv) {
     expectArch: null,
     maxBlockmapSkew: 600,
     json: false,
+    allowUnsigned: false,
+    strict: false,
   };
   const takesValue = new Set([
     '--dir',
@@ -57,6 +61,14 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--json') {
       opts.json = true;
+      continue;
+    }
+    if (arg === '--allow-unsigned') {
+      opts.allowUnsigned = true;
+      continue;
+    }
+    if (arg === '--strict') {
+      opts.strict = true;
       continue;
     }
     if (arg === '--help' || arg === '-h') {
@@ -91,9 +103,13 @@ function printUsage() {
   --manifest <文件名>       清单名，默认 latest.yml
   --exe <路径>              只校验指定 exe（仍会核对清单）
   --expect-version <版本>   期望版本，默认读项目 package.json
-  --expect-arch <架构>      期望架构：x64 | arm64 | x86
+  --expect-arch <架构>      期望架构：x64 | arm64 | x86（NSIS 包会校验载荷 exe）
   --max-blockmap-skew <秒>  blockmap 与 exe 的 mtime 允许差，默认 600
+  --allow-unsigned          明确接受未签名产物：NotSigned 记为 SKIP 而非 FAIL
+  --strict                  有 SKIP 即视为未通过（CI 发布门禁用，退出码 3）
   --json                    输出 JSON
+
+退出码：0 无 FAIL；1 有 FAIL；2 参数/环境错误；3 --strict 下存在 SKIP。
 `);
 }
 
@@ -228,6 +244,58 @@ export function readPeMachine(buffer) {
   };
 }
 
+// ---------------------------------------------------------------- NSIS 判定
+
+/**
+ * NSIS 安装包的引导程序**恒为 32 位**（makensis 生成的 stub 固定 x86），
+ * 即使载荷是 x64/arm64。因此对 nsis 产物直接比对 `--expect-arch` 必然误报 x86。
+ * NSIS 的 firstheader 里带 `NullsoftInst` 标记，用它区分「32 位包打错了」与「NSIS 正常引导」。
+ */
+const NSIS_MARKER = Buffer.from('NullsoftInst', 'latin1');
+
+export function isNsisStub(buffer) {
+  return buffer.lastIndexOf(NSIS_MARKER) !== -1;
+}
+
+/**
+ * 找打包目录里的应用本体 exe，用来校验真正的载荷架构。
+ * 依次看 `<dir>/win-unpacked`、`<dir>/../win-unpacked`、`<dir>/win-<arch>-unpacked`。
+ * 收尾后的 `dist/package` 目录通常不含 unpacked 目录，此时返回 null（调用方标 SKIP）。
+ */
+async function findPayloadExe(dir) {
+  const candidates = [
+    join(dir, 'win-unpacked'),
+    join(dir, '..', 'win-unpacked'),
+    join(dir, 'win-x64-unpacked'),
+    join(dir, 'win-arm64-unpacked'),
+    join(dir, '..', 'win-x64-unpacked'),
+    join(dir, '..', 'win-arm64-unpacked'),
+  ];
+  for (const c of candidates) {
+    if (!existsSync(c)) continue;
+    let entries;
+    try {
+      entries = await readdir(c);
+    } catch {
+      continue;
+    }
+    const exes = entries.filter((f) => f.toLowerCase().endsWith('.exe'));
+    if (!exes.length) continue;
+    // 应用本体通常是最大的那个 exe（排除 crashpad / 小工具）
+    let best = null;
+    for (const f of exes) {
+      try {
+        const st = await stat(join(c, f));
+        if (!best || st.size > best.size) best = { f, size: st.size };
+      } catch {
+        /* ignore */
+      }
+    }
+    if (best) return join(c, best.f);
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- Authenticode
 
 function probeCommand(cmd) {
@@ -236,30 +304,50 @@ function probeCommand(cmd) {
 }
 
 function verifyAuthenticodeWindows(exePath) {
+  // 注意：这里必须用**多行**脚本并避开「hashtable 字面量里写 if 语句」——
+  //   ① 原实现用 '; ' 把多行 join 成一行，会产出 `[ordered]@{; Status = ...`，PS 直接语法报错；
+  //   ② Windows PowerShell 5.1 不允许 `@{ k = if (...) {...} else {...} }`，必须先把值算进变量。
+  // 用 -EncodedCommand（UTF-16LE base64）传参，可彻底绕开中文路径与引号转义问题。
+  const literal = exePath.replace(/'/g, "''");
   const script = [
-    `$s = Get-AuthenticodeSignature -LiteralPath '${exePath.replace(/'/g, "''")}'`,
-    '$ts = $null',
-    'if ($s.TimeStamperCertificate -ne $null) { $ts = $s.TimeStamperCertificate.Subject }',
-    '$out = [ordered]@{',
-    '  Status = [string]$s.Status',
-    '  StatusMessage = [string]$s.StatusMessage',
-    '  Subject = if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { "" }',
-    '  Thumbprint = if ($s.SignerCertificate) { $s.SignerCertificate.Thumbprint } else { "" }',
-    '  TimestampSubject = if ($ts) { $ts } else { "" }',
-    '}',
-    '$out | ConvertTo-Json -Compress',
-  ].join('; ');
+    `$ErrorActionPreference = 'Stop'`,
+    `try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}`,
+    `try {`,
+    `  $s = Get-AuthenticodeSignature -LiteralPath '${literal}'`,
+    `} catch {`,
+    `  '{"Status":"Error","StatusMessage":"' + ($_.Exception.Message -replace '"','\\"') + '","Subject":"","Thumbprint":"","TimestampSubject":""}'`,
+    `  exit 0`,
+    `}`,
+    `$subject = ''`,
+    `$thumb = ''`,
+    `$ts = ''`,
+    `if ($s.SignerCertificate -ne $null) { $subject = $s.SignerCertificate.Subject; $thumb = $s.SignerCertificate.Thumbprint }`,
+    `if ($s.TimeStamperCertificate -ne $null) { $ts = $s.TimeStamperCertificate.Subject }`,
+    `$out = [ordered]@{`,
+    `  Status = [string]$s.Status`,
+    `  StatusMessage = [string]$s.StatusMessage`,
+    `  Subject = $subject`,
+    `  Thumbprint = $thumb`,
+    `  TimestampSubject = $ts`,
+    `}`,
+    `$out | ConvertTo-Json -Compress`,
+  ].join('\n');
 
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
   const r = spawnSync(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-Command', script],
-    { encoding: 'utf8', timeout: 60000 }
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+    { encoding: 'utf8', timeout: 60000, windowsHide: true }
   );
   if (r.error) return { ok: false, reason: `PowerShell 调用失败：${r.error.message}` };
+  const stdout = (r.stdout || '').trim();
+  if (!stdout) {
+    return { ok: false, reason: `PowerShell 无输出（退出码 ${r.status}）：${(r.stderr || '').trim().split('\n')[0] || '未知'}` };
+  }
   try {
-    return { ok: true, data: JSON.parse(r.stdout.trim()) };
+    return { ok: true, data: JSON.parse(stdout.split(/\r?\n/).pop()) };
   } catch {
-    return { ok: false, reason: `返回值无法解析：${r.stdout || r.stderr}` };
+    return { ok: false, reason: `返回值无法解析：${stdout.slice(0, 200)}` };
   }
 }
 
@@ -387,11 +475,28 @@ async function main() {
       }
     }
 
-    // PE 架构
+    // PE 架构（NSIS 安装包要看载荷，不能直接比对引导程序）
     const buf = await readFile(filePath);
     const pe = readPeMachine(buf);
     if (!pe.ok) {
       fail(`PE 合法：${label}`, pe.reason);
+    } else if (isNsisStub(buf)) {
+      const payloadPath = await findPayloadExe(dir);
+      let payloadArch = null;
+      if (payloadPath) {
+        const p = readPeMachine(await readFile(payloadPath));
+        if (p.ok) payloadArch = p.arch;
+      }
+      if (!payloadArch) {
+        pass(`PE 架构：${label}`, 'NSIS 引导 x86（正常）；载荷 exe 未找到，架构未复核');
+      } else if (opts.expectArch && payloadArch !== opts.expectArch) {
+        fail(
+          `PE 架构：${label}`,
+          `载荷 ${payloadArch} ≠ 期望 ${opts.expectArch}（NSIS 引导 x86 属正常）`
+        );
+      } else {
+        pass(`PE 架构：${label}`, `NSIS 引导 x86（正常）+ 载荷 ${payloadArch}`);
+      }
     } else if (opts.expectArch && pe.arch !== opts.expectArch) {
       fail(`PE 架构：${label}`, `实际 ${pe.arch} ≠ 期望 ${opts.expectArch}`);
     } else {
@@ -419,15 +524,22 @@ async function main() {
     if (process.platform === 'win32') {
       const r = verifyAuthenticodeWindows(filePath);
       if (!r.ok) {
-        skip(`Authenticode：${label}`, r.reason);
+        // 在 Windows 上「签名校验没跑起来」不能当 SKIP：组策略 / AppLocker / 执行策略
+        // 都可能让它失败，若记 SKIP 又不影响退出码，签名分支等于从未验证过。
+        fail(`Authenticode：${label}`, `Windows 上无法完成签名校验，不能当作通过：${r.reason}`);
       } else {
         const d = r.data;
+        const unsigned = String(d.Status) === 'NotSigned';
         if (String(d.Status) === 'Valid') {
           pass(`Authenticode：${label}`, d.Subject || '(无 subject)');
+        } else if (unsigned && opts.allowUnsigned) {
+          skip(`Authenticode：${label}`, '未签名（--allow-unsigned 已声明接受，用户会看到 SmartScreen）');
         } else {
           fail(`Authenticode：${label}`, `${d.Status} ${d.StatusMessage || ''}`.trim());
         }
-        if (d.TimestampSubject) {
+        if (unsigned) {
+          skip(`时间戳：${label}`, '未签名，无时间戳');
+        } else if (d.TimestampSubject) {
           pass(`时间戳：${label}`, d.TimestampSubject);
         } else {
           fail(`时间戳：${label}`, '缺少时间戳（证书过期后签名即失效）');
@@ -466,9 +578,13 @@ async function main() {
 function finish(opts) {
   const failed = results.filter((r) => r.status === 'FAIL');
   const skipped = results.filter((r) => r.status === 'SKIP');
+  // 默认语义：exit 0 = 无 FAIL（SKIP 需人工复核）；--strict 下 SKIP 也算未通过 → 3
+  const code = failed.length ? 1 : opts.strict && skipped.length ? 3 : 0;
 
   if (opts.json) {
-    console.log(JSON.stringify({ ok: failed.length === 0, failed: failed.length, skipped: skipped.length, results }, null, 2));
+    console.log(
+      JSON.stringify({ ok: code === 0, exitCode: code, failed: failed.length, skipped: skipped.length, strict: !!opts.strict, results }, null, 2)
+    );
   } else {
     console.log('');
     for (const r of results) {
@@ -476,20 +592,59 @@ function finish(opts) {
       console.log(`  ${icon} ${r.name}${r.detail ? `  — ${r.detail}` : ''}`);
     }
     console.log('');
-    if (failed.length === 0) {
+    if (failed.length) {
+      console.log(`结论：${failed.length} 项失败，该产物不得分发`);
+    } else if (skipped.length && opts.strict) {
+      console.log(`结论：无 FAIL，但 --strict 下有 ${skipped.length} 项 SKIP，按未通过处理`);
+    } else if (skipped.length) {
       console.log(`结论：通过（${results.length - skipped.length} 项），SKIP ${skipped.length} 项需人工复核`);
     } else {
-      console.log(`结论：${failed.length} 项失败，该产物不得分发`);
+      console.log(`结论：通过（${results.length} 项）`);
     }
   }
 
-  process.exit(failed.length === 0 ? 0 : 1);
+  process.exit(code);
 }
 
-const isCli = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
+/**
+ * CLI 入口判定。
+ *
+ * ⚠️ 历史 bug（务必不要回退成旧写法）：曾用
+ *     `resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)`
+ *   Windows 下 `new URL(...).pathname` 形如 `/C:/dir/a.mjs`，而 argv[1] 是 `C:\dir\a.mjs`，
+ *   两者永不相等 → `main()` 不执行、进程以 0 退出 —— 表现为「校验静默通过」，
+ *   比校验失败危险得多（发布流程会误判产物合格）。
+ * 现在改用 fileURLToPath 归一化，并加一道「疑似入口却没匹配上」的硬报错。
+ */
+const isCli = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const norm = (p) => {
+    let v;
+    try {
+      v = realpathSync(p);
+    } catch {
+      v = p;
+    }
+    return process.platform === 'win32' ? v.toLowerCase() : v;
+  };
+  try {
+    return norm(entry) === norm(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
 if (isCli) {
   main().catch((e) => {
     console.error(e instanceof Error ? e.message : String(e));
     process.exit(2);
   });
+} else if (process.argv[1] && basename(process.argv[1]) === basename(fileURLToPath(import.meta.url))) {
+  // 通过「同名脚本被当作入口调用」兜底：宁可报错，也不静默 exit 0
+  console.error(
+    `[verify-win-artifact] 无法确认 CLI 入口（argv[1]=${process.argv[1]}），拒绝静默退出。\n` +
+      '若通过符号链接/大小写不同的路径调用，请改用真实路径重跑。'
+  );
+  process.exit(2);
 }
