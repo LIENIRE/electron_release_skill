@@ -127,7 +127,7 @@ node ~/.agents/skills/electron-release/scripts/build.mjs --dry-run .
 
 | 选项 | 说明 |
 |---|---|
-| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）；选项与位置参数顺序无关 |
+| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）；选项与位置参数顺序无关。**两平台请分开跑**，`all` 的收尾只读 `latest-mac.yml`，且共用 `package/` 会互相覆盖 |
 | `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`） |
 | `--name-prefix <前缀>` | 指定产物 ASCII 前缀（默认从包名/appId 推断） |
 | `--skip-tests` | 跳过单元测试 |

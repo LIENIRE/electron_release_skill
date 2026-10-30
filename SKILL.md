@@ -180,7 +180,7 @@ node <SKILL_DIR>/scripts/build.mjs[选项] [项目根目录]
 
 | 选项 | 说明 |
 |---|---|
-| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）。选项与位置参数顺序无关，`--platform win .` 与 `. --platform win` 等价 |
+| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）。选项与位置参数顺序无关，`--platform win .` 与 `. --platform win` 等价。**要出两平台安装包请分别跑两次**：`all` 的收尾只读 mac 清单（`latest-mac.yml`），且共用同一个 `package/` 会互相覆盖 |
 | `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`） |
 | `--name-prefix <前缀>` | 指定产物 ASCII 前缀（默认从包名/appId 推断） |
 | `--skip-tests` | 跳过单元测试 |
