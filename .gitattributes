@@ -1,0 +1,6 @@
+# 跨平台分发：脚本与文档统一 LF，避免 Windows 检出后 install.sh 无法执行
+* text=auto eol=lf
+*.sh text eol=lf
+*.mjs text eol=lf
+*.md text eol=lf
+*.json text eol=lf

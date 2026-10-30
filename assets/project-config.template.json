@@ -1,0 +1,91 @@
+{
+  "_说明": "项目级打包发布配置。复制为 .electron-release.json 放在项目根目录，skill 会自动读取并合并项目画像。不提交到git（加入 .gitignore）。",
+
+  "project": {
+    "_必填": "用于校验版本号/tag 一致性、产物命名核对",
+    "repo": "owner/repo-name",
+    "defaultBranch": "main"
+  },
+
+  "version": {
+    "_说明": "版本号策略",
+    "bumpDefault": "patch",
+    "tagPrefix": "v"
+  },
+
+  "build": {
+    "_说明": "覆盖 probe.mjs 探测到的默认值；不确定的项可留 null",
+    "command": null,
+    "outputDir": null,
+    "targets": {
+      "mac": ["dmg", "zip"],
+      "win": ["nsis", "zip"],
+      "linux": null
+    }
+  },
+
+  "release": {
+    "_说明": "自动更新分发配置。两种模式：github=安装包与清单都在GitHub；generic=安装包在 GitHub、清单在自建服务器",
+    "mode": "generic",
+    "ghRelease": true,
+    "feedManifest": true,
+    "ssh": {
+      "_说明": "mode=generic 时必填。域名被本地代理劫持时 host 需填真实 IP",
+      "host": null,
+      "user": null,
+      "port": 22,
+      "identity": null,
+      "dir": null
+    }
+  },
+
+  "signing": {
+    "_说明": "签名与公证。mac 需 Developer ID 证书（Apple Developer Program 付费）；若显式跳过则 macIdentity 设为 null",
+    "macIdentity": null,
+    "notarize": false,
+    "hardenedRuntime": false,
+    "entitlements": null,
+    "entitlementsInherit": null,
+
+    "windows": {
+      "_说明": "证书三选一。certificateSha1 一旦设置即独占来源，不回退 PFX/WIN_CSC_LINK。publisherName 必须与证书 Subject 完全一致（建议完整 DN）。",
+      "method": null,
+      "_method取值": ["certificateSha1", "certificateSubjectName", "certificateFile", "none"],
+      "certificateSha1": null,
+      "certificateSubjectName": null,
+      "certificateFile": null,
+      "publisherName": null,
+      "timestampServer": "http://timestamp.digicert.com",
+      "cloudSigner": {
+        "_说明": "SimplySign 等虚拟智能卡方案：客户端必须保持登录；prewarm 会在构建前先签一次以触发 PIN/手机确认",
+        "enabled": false,
+        "requireLoggedIn": true,
+        "prewarm": true,
+        "pinCacheMinutes": 180,
+        "expectedHasPrivateKey": true
+      }
+    },
+
+    "nsis": {
+      "_说明": "未配置时 electron-builder 默认 oneClick=true（静默安装、不可选目录）。需要选目录必须 oneClick=false",
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
+    }
+  },
+
+  "manualGates": {
+    "_说明": "该项目中需要人工确认的关卡。skill 会逐项提示，不会自动跳过。",
+    "confirmVersionBump": true,
+    "confirmRemoteWrite": true,
+    "confirmCertificateSubject": false
+  },
+
+  "verify": {
+    "_说明": "发布后是否执行端到端升级验证（必须实机操作，无法脚本化）",
+    "requireE2EUpgradeTest": true
+  },
+
+  "notes": []
+}
