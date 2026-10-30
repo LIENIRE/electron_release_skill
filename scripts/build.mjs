@@ -247,14 +247,26 @@ function runTests() {
 }
 
 // ---------- 步骤3：构建 ----------
+/**
+ * 所有构建相关 spawn 共用的环境变量。
+ *
+ * WorkBuddy 沙箱的 shim（NODE_OPTIONS=--require .../node-language-shim.cjs）会打断
+ * asar 写入，**必须剥掉**。兜底路径（node cli.js / --prepackaged 续跑）也必须走这里，
+ * 否则一旦走兜底就会带着 shim 再跑一遍，主路径刻意剥离的意义归零。
+ */
+function buildEnv() {
+  const env = { ...process.env };
+  if (env.NODE_OPTIONS) {
+    delete env.NODE_OPTIONS;
+    dim('已剥离 NODE_OPTIONS（沙箱 shim 会打断 asar 写入）');
+  }
+  return env;
+}
+
 /** 执行构建命令，返回 { ok, out, via } */
 function doBuild(plan) {
   log(`构建：${plan.via}`);
-  const env = { ...process.env };
-  // WorkBuddy 沙箱会打断 asar 写入（Brokered file token refused），必须剥掉
-  if (env.NODE_OPTIONS) { delete env.NODE_OPTIONS; dim('已剥离 NODE_OPTIONS（沙箱 shim 会打断 asar 写入）'); }
-
-  const r = runTool(plan.cmd, plan.args, { encoding: 'utf8', env });
+  const r = runTool(plan.cmd, plan.args, { encoding: 'utf8', env: buildEnv() });
   // spawn 自身失败（ENOENT / EACCES）时 stdout/stderr 都是空的，必须把 r.error 带上，
   // 否则报错信息为空、兜底判定也无从命中（表现为「构建失败 + 一片空白」）。
   const out = ((r.stdout || '') + (r.stderr || '') + (r.error ? `\n${r.error.code || 'SPAWN_ERROR'} ${r.error.message}` : '')).trim();
@@ -290,12 +302,25 @@ function localBuilderCli() {
  *   项目自身的 `vite build` 因缺模块失败时会被误判，随后直接跑 electron-builder
  *   把上一次的旧产物打进安装包，收尾与校验还会全部通过 —— 静默发旧版本。
  */
-const SHIM_FAILURE = /不是内部或外部命令|is not recognized as an internal or external command|Missing script/i;
+const SHIM_FAILURE = /不是内部或外部命令|is not recognized as an internal or external command/i;
+
+/**
+ * npm 的 `Missing script: x` 只有在 x **正是本次请求的那个脚本**时才算回退信号。
+ * 若缺的是项目脚本内部调用的子脚本（`build:win` → `electron:build` 不存在），
+ * 说明构建链本身坏了；此时回退到裸 electron-builder 会跳过 `vite build`，
+ * 直接把 `dist/` 里上一次的旧产物打进安装包 —— 与 `Cannot find module` 同一类事故。
+ */
+function missingScriptIsRequest(res) {
+  const m = /Missing script:\s*"?([^\s"]+)"?/i.exec(res.out || '');
+  if (!m) return false;
+  const req = /npm run\s+(\S+)/.exec(res.via || '');
+  return Boolean(req) && m[1] === req[1];
+}
 
 function shouldFallbackToCli(res) {
   if (!res || !['npm', 'npx'].includes(res.cmd)) return false;
   if (res.spawnError === 'ENOENT' || res.spawnError === 'EACCES') return true;
-  return SHIM_FAILURE.test(res.out || '');
+  return SHIM_FAILURE.test(res.out || '') || missingScriptIsRequest(res);
 }
 
 function buildWithNodeCli(summary) {
@@ -307,7 +332,7 @@ function buildWithNodeCli(summary) {
   warn(`npm 脚本不可用（${summary}），回退到 node cli.js`);
   const flags = PLATFORM === 'all' ? [] : [`--${PLATFORM}`];
   const args = [cli, ...flags, '--publish', 'never'];
-  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, env: buildEnv() });
   const out = ((r.stdout || '') + (r.stderr || '')).trim();
   return { ok: r.status === 0, out, via: `node cli.js ${args.slice(1).join(' ')}` };
 }
@@ -407,14 +432,23 @@ function recoverFromRceditLock(out) {
     return false;
   }
   const cli = localBuilderCli();
-  const appOutDir = path.join(OUTPUT_DIR, 'win-unpacked');
+  // 目录名通常是 win-unpacked；多架构并行构建时 electron-builder 会用 win-<arch>-unpacked
+  let appOutDir = path.join(OUTPUT_DIR, 'win-unpacked');
+  if (!fs.existsSync(appOutDir) && fs.existsSync(OUTPUT_DIR)) {
+    const alt = fs.readdirSync(OUTPUT_DIR).find((f) => /^win-.+-unpacked$/.test(f));
+    if (alt) appOutDir = path.join(OUTPUT_DIR, alt);
+  }
+  if (!fs.existsSync(appOutDir)) {
+    bad(`找不到未打包目录（${appOutDir}），无法用 --prepackaged 续跑`);
+    return false;
+  }
   if (!cli) {
     bad('找不到 node_modules/electron-builder/cli.js，无法续跑安装包');
     return false;
   }
   log(`续跑分发目标：--prepackaged ${appOutDir}`);
   const args = [cli, '--win', '--publish', 'never', '--prepackaged', appOutDir];
-  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, env: buildEnv() });
   const o = ((r.stdout || '') + (r.stderr || '')).trim();
   if (r.status !== 0) {
     bad('续跑失败，末尾输出：');
@@ -472,9 +506,17 @@ function finalize(outDir) {
   if (PLATFORM === 'win') {
     const zi = fs.readdirSync(OUTPUT_DIR);
     const allZips = zi.filter((f) => /\.zip$/i.test(f));
-    const mine = allZips.filter((f) => f.includes(VERSION) && /win/i.test(f));
+    // 版本号要按「分隔符边界」比对：裸 includes('1.1.1') 会把 1.1.10 也算成本批次。
+    const esc = VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const verRe = new RegExp(`(^|[\\s._-])${esc}([\\s._-]|$)`);
+    const mine = allZips.filter((f) => verRe.test(f) && /win/i.test(f));
     for (const f of allZips) {
       if (!mine.includes(f)) dim(`  跳过非本批次 zip：${f}`);
+    }
+    if (!mine.length) {
+      // 不能静默：artifactName 不含 win / 不含版本号时这里会零收，
+      // 用户会以为免安装包已进 package/（实际只有安装包）。
+      warn(`未找到本批次 win zip（version=${VERSION}）——若项目配置了 zip 目标，请核对 artifactName`);
     }
     for (const f of mine) {
       const dest = path.join(outDir, asciiName(f));
@@ -562,6 +604,14 @@ else if (usingProjectScript) warn(`项目无 package 类脚本，只有 ${plan.v
 else warn(`项目无可用打包脚本，回退到：${plan.via} —— 本脚本将补齐收尾`);
 
 const outDir = opt('--out') || path.join(OUTPUT_DIR, 'package');
+
+// `--out` 指到产物目录本身时自毁：finalize 开头就 rmSync(outDir) 重建，
+// 刚构建的 exe / win-unpacked 会一起被删，随后报「清单引用的产物不存在」，
+// 看不出真实原因。这里直接拒绝，比事后排查便宜。
+if (!DRY && !NO_FINALIZE && path.resolve(outDir) === path.resolve(OUTPUT_DIR)) {
+  bad(`--out 不能等于产物目录本身（${OUTPUT_DIR}）：收尾会清空该目录`);
+  process.exit(2);
+}
 
 if (DRY) {
   dim('dry-run：以上为将要执行的步骤，未实际运行');

@@ -389,7 +389,8 @@ node <SKILL_DIR>/scripts/verify-win-artifact.mjs --dir release --expect-version 
 ✗ PE 架构：MyApp-Setup-1.2.3.exe  — 实际 x86 ≠ 期望 x64   ← 假阳性
 ```
 
-脚本处理方式：识别 firstheader 里的 `NullsoftInst` 标记 → 判定为 NSIS 引导 →
+脚本处理方式：识别文件里的 `NullsoftInst` 标记（由 NSIS firstheader 写入；实现是扫全文件
+`lastIndexOf`，不解析 PE 节，避免被非标准节表坑到）→ 判定为 NSIS 引导 →
 改为读取 `<dir>/win-unpacked`（或 `../win-unpacked`）里体积最大的 exe 作为载荷，
 校验它的架构。输出形如：
 
@@ -397,8 +398,17 @@ node <SKILL_DIR>/scripts/verify-win-artifact.mjs --dir release --expect-version 
 ✓ PE 架构：MyApp-Setup-1.2.3.exe  — NSIS 引导 x86（正常）+ 载荷 x64
 ```
 
-收尾目录（如 `dist/package`）通常不含 unpacked 目录时，退化为
-「载荷 exe 未找到，架构未复核」——**不判失败**，但要人工在 `win-unpacked` 上补一次。
+收尾目录（如 `dist/package`）通常不含 unpacked 目录。此时该行记 **SKIP**：
+
+```
+! PE 架构：MyApp-Setup-1.2.3.exe  — NSIS 引导 x86（恒为 32 位，正常）；目录内找不到
+  win-unpacked 载荷，无法核对 --expect-arch —— 需在 dist/win-unpacked 上补验
+```
+
+**不能记 PASS**：这种情况 `--expect-arch` 根本没被比对过，记 PASS 就是把「没校验」
+显示成对勾——正是 §7.2 要防的那类假通过。默认退出码不变（SKIP 不影响），
+发布门禁加 `--strict` 即会被拦下（退出码 `3`）。补验方式：`--dir dist`，
+或直接对 `dist/win-unpacked/MyApp.exe` 手工核验（见下）。
 
 > 顺带：ASCII 改名收尾时 `.blockmap` 必须跟着改同名。`latest.yml` 不列 blockmap，
 > 漏拷不会报错，只会让 electron-updater 静默退化为全量下载。

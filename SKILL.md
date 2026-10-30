@@ -195,9 +195,10 @@ node <SKILL_DIR>/scripts/build.mjs[选项] [项目根目录]
    以清单 `files[]` 为权威来源收齐 → ASCII 改名（含 `.blockmap` 同步改名）→
    YAML 解析改写 url → 逐条校验 sha512
 3. **`npm run` / `npx` 在本机不可用**（`.bin` 缺本平台 shim，见 §5.10）—— 仅当失败信息
-   属 shim 类（`不是内部或外部命令` / spawn `ENOENT` / `Missing script`）时回退到
-   `node node_modules/electron-builder/cli.js`；项目自身编译报错（如 `Cannot find module`）
-   **不触发回退**，否则会绕过前端构建、把上一次的旧产物打进安装包
+   属 shim 类（`不是内部或外部命令` / spawn `ENOENT` / `Missing script: <本次请求的脚本>`）时
+   回退到 `node node_modules/electron-builder/cli.js`；项目自身编译报错（如 `Cannot find module`）
+   或**脚本内部子脚本缺失**（`Missing script: electron:build`）**不触发回退**，
+   否则会绕过前端构建、把上一次的旧产物打进安装包
 4. **Windows rcedit 被实时防护锁定**（见 §5.9）—— 解析日志里的原始 rcedit 命令行退避补写，
    再用 `--prepackaged <outputDir>/win-unpacked` 只补跑分发目标，避免整包重跑再次触发锁
 
@@ -256,7 +257,8 @@ Windows 侧不要只确认"清单存在"——签名时序错误、混入旧批�
   x64 应用打出来的 `Setup.exe` 也是 x86 PE —— 直接比对必然报「实际 x86 ≠ 期望 x64」。
   脚本已识别 `NullsoftInst` 标记，自动改为校验 `win-unpacked` 里的载荷 exe
   （输出形如 `NSIS 引导 x86（正常）+ 载荷 x64`）。若收尾目录里没有 unpacked 目录，
-  会退化为「载荷未找到，架构未复核」而不是报失败。
+  该行记 **SKIP**（`!`）而不是 PASS —— 此时 `--expect-arch` 一次都没比对过，
+  记 PASS 就等于把「没校验」显示成对勾。发布门禁加 `--strict` 会因此失败。
 - **不签名的项目加 `--allow-unsigned`**。默认 `NotSigned` 记 FAIL（这是对的：构建成功 ≠ 能分发），
   但 `identity: null` / 内部工具场景需要显式接受，让它变 SKIP，便于在 CI 里把
   「其他项」当硬门禁。
@@ -550,7 +552,7 @@ stat -f '%Sm' dist/package/latest-mac.yml# macOS
 
 - 同一文件 fail 后等 8~30 秒手动重跑同一条命令**必成功**
 - `rcedit 0.2.0` 与 `2.0.0` 行为一致，参数逐字相同
-- electron-builder 内部重试共 4 次尝试、全部在 1 秒内结束，永远赶不上防护释放
+- electron-builder 内部共 4 次尝试（日志 `retrying 3 more times`），实测全部在约 1 秒内结束，赶不上防护释放
 
 **处置**（`build.mjs` 已内置，`--platform win` 时自动生效）：
 
@@ -739,7 +741,7 @@ rm -rf dist release out
 [项目] <name> v<version>  （<配置来源>）
 [产物] <路径列表与大小>
 [清单] <路径>  version 一致性: ✓/✗
-[架构] Windows: 安装包引导 x86（NSIS 正常）/ 载荷 x64
+[架构] Windows: 安装包引导 x86（NSIS 正常）/ 载荷 x64；找不到 unpacked 时写「载荷未确认，需补验」（SKIP，不得写通过）
 [签名] macOS: Developer ID / adhoc / 未签名；Windows: Authenticode 有效 / 无效 / 未签名
 [时间戳] 有 / 无 / 不适用（Windows 无时间戳时证书过期即失效）
 [公证] 已公证 / 未公证 / 未配置（仅 macOS）

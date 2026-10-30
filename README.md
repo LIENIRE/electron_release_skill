@@ -241,7 +241,7 @@ node scripts/verify-win-artifact.mjs --dir dist/package --expect-version 1.1.1 \
 | 能力 | 说明 |
 |---|---|
 | 清单配对 | version / size / sha512 / `path` 与 `files[0]` 一致 |
-| PE 架构 | 识别 `NullsoftInst`，NSIS 包改为校验 `win-unpacked` 载荷，不误报 x86 |
+| PE 架构 | 识别 `NullsoftInst`，NSIS 包改为校验 `win-unpacked` 载荷，不误报 x86；找不到载荷记 SKIP（不记 PASS） |
 | blockmap 批次 | 与安装包 mtime 比对，识别混入旧批次 |
 | Authenticode | Windows 走 `Get-AuthenticodeSignature`（`-EncodedCommand`，兼容中文路径）；Windows 上执行失败记 **FAIL**，不降级为 SKIP |
 | `--allow-unsigned` | 不签名项目把 `NotSigned` 降为 SKIP，其余项仍作硬门禁 |

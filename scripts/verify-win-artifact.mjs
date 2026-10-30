@@ -18,8 +18,10 @@
  *                                [--exe <path>] [--expect-version 1.2.3]
  *                                [--expect-arch x64|arm64|x86] [--json]
  *                                [--max-blockmap-skew 600] [--allow-unsigned]
+ *                                [--strict] [--json]
  *
- * 退出码：0 全部通过；1 有失败项；2 参数/环境错误。
+ * 退出码：0 无 FAIL（SKIP 需人工复核）；1 有 FAIL；2 参数/环境错误；
+ *         3 加了 --strict 且存在 SKIP（发布门禁用）。
  *
  * 设计约束：
  *   - 不修改任何文件，只读
@@ -488,7 +490,13 @@ async function main() {
         if (p.ok) payloadArch = p.arch;
       }
       if (!payloadArch) {
-        pass(`PE 架构：${label}`, 'NSIS 引导 x86（正常）；载荷 exe 未找到，架构未复核');
+        // 不能记 PASS：此时 `--expect-arch` 一次都没被比对过。记 PASS 等于把「没校验」
+        // 显示成绿色对勾，正是本脚本要防的那类假通过（§7.2）。记 SKIP：默认退出码不变，
+        // 发布门禁加 --strict 时会被拦下。
+        skip(
+          `PE 架构：${label}`,
+          'NSIS 引导 x86（恒为 32 位，正常）；目录内找不到 win-unpacked 载荷，无法核对 --expect-arch —— 需在 dist/win-unpacked 上补验'
+        );
       } else if (opts.expectArch && payloadArch !== opts.expectArch) {
         fail(
           `PE 架构：${label}`,
