@@ -127,22 +127,37 @@ node ~/.agents/skills/electron-release/scripts/build.mjs --dry-run .
 
 | 选项 | 说明 |
 |---|---|
-| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac） |
+| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）；选项与位置参数顺序无关 |
 | `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`） |
 | `--name-prefix <前缀>` | 指定产物 ASCII 前缀（默认从包名/appId 推断） |
 | `--skip-tests` | 跳过单元测试 |
 | `--no-finalize` | 只构建，不收尾不校验 |
 | `--dry-run` | 只打印将执行的步骤 |
 
-**它解决两个高频问题**：
+**它解决四个高频问题**：
 
 1. **打包脚本只在部分分支上存在** —— 自动按 `package` → `build:mac` → 裸
    `electron-builder` 选择，缺失时明确提示「本脚本将补齐收尾」
 2. **裸 builder 不做收尾** —— 无论用哪个命令，都统一执行「以清单 files[] 为权威来源
-   收齐 → ASCII 改名 → YAML 解析改写 url → 逐条校验 sha512 → 批次核对」
+   收齐 → ASCII 改名（含 `.blockmap` 同名）→ YAML 解析改写 url → 逐条校验 sha512 → 批次核对」
+3. **`npm run` / `npx` 在本机不可用** —— `.bin` 缺本平台 shim（`node_modules` 跨平台拷来的）
+   时，自动回退 `node node_modules/electron-builder/cli.js`
+4. **Windows rcedit 被实时防护锁定** —— 解析日志里的原始 rcedit 命令行退避补写，
+   再用 `--prepackaged` 只补跑分发目标，不整包重跑
 
 > ⚠️ 换了构建命令**不等于**可以跳过收尾。`build:mac` 与裸 `electron-builder` 都不会
 > 产 ASCII 名与配对清单，直接投放会导致客户端 sha512 校验失败。
+
+Windows 上一次成功构建的真实日志（用于对照是否走到兜底分支）：
+
+```
+▸ 构建：npm run build:win
+! npm 脚本不可用（npm run build:win），回退到 node cli.js
+✗ rcedit 被实时防护短暂锁定，进入退避补写
+  ✓ rcedit 补写成功（第 2 次尝试）
+▸ 续跑分发目标：--prepackaged dist\win-unpacked
+✓ idea-note-Setup-1.1.1.exe  94MB
+```
 
 ## 脚本能力
 
@@ -206,6 +221,33 @@ $ verify-artifact.sh --feed https://example.com/updates/ 1.2.3
 误判成代理问题。同时校验线上版本与期望是否一致、检查清单 url 是相对（同目录托管）
 还是绝对地址（分开托管）。
 
+### `verify-win-artifact.mjs` —— Windows 产物断言
+
+```bash
+node scripts/verify-win-artifact.mjs --dir dist/package --expect-version 1.1.1 \
+  --expect-arch x64 --allow-unsigned
+```
+
+```
+✓ 清单存在  — dist/package/latest.yml
+✓ 版本一致  — 1.1.1
+✓ sha512 一致：idea-note-Setup-1.1.1.exe  — 8kY2uDNmVaSeublo…
+✓ PE 架构：idea-note-Setup-1.1.1.exe  — NSIS 引导 x86（正常）+ 载荷 x64
+✓ blockmap：idea-note-Setup-1.1.1.exe  — 同批（mtime 差 2s）
+! Authenticode：… — 未签名（--allow-unsigned 已声明接受，用户会看到 SmartScreen）
+结论：通过（9 项），SKIP 2 项需人工复核
+```
+
+| 能力 | 说明 |
+|---|---|
+| 清单配对 | version / size / sha512 / `path` 与 `files[0]` 一致 |
+| PE 架构 | 识别 `NullsoftInst`，NSIS 包改为校验 `win-unpacked` 载荷，不误报 x86 |
+| blockmap 批次 | 与安装包 mtime 比对，识别混入旧批次 |
+| Authenticode | Windows 走 `Get-AuthenticodeSignature`（`-EncodedCommand`，兼容中文路径）；Windows 上执行失败记 **FAIL**，不降级为 SKIP |
+| `--allow-unsigned` | 不签名项目把 `NotSigned` 降为 SKIP，其余项仍作硬门禁 |
+| `--strict` | 有 SKIP 即非 0（退出码 3），发布门禁用；默认 `exit 0 = 无 FAIL` |
+| 入口自检 | 无法确认 CLI 入口时 **exit 2**，不会静默 `exit 0` 假装通过 |
+
 ---
 
 ## 覆盖范围
@@ -246,11 +288,17 @@ $ verify-artifact.sh --feed https://example.com/updates/ 1.2.3
 | 完整构建 | 在 idea-note-desktop 实测 `electron-builder --mac`，arm64+x64 共 4 个安装包 + blockmap，36 秒完成 |
 | Windows 产物校验 | 临时产物 + 手工构造 `latest.yml`：正向 9 项 PASS；注入 sha512 篡改、架构不符、blockmap 旧批次三类故障均被拦截；退出码 0/1/2 正确 |
 | Windows 签名探测 | 真实项目实测：正确识别 `publisherName`、RFC3161 时间戳、缺省 `nsis` 块（`oneClick=true`） |
+| Windows 端到端打包 | 真实项目（Electron 33.4.11 + electron-builder 25.1.8，Windows 11 26200 / Node 22）：
+`build.mjs --platform win` 一次跑通「测试 144 用例 → npm shim 回退 → rcedit 锁退避补写 →
+`--prepackaged` 续跑 nsis/zip → ASCII 改名 + blockmap 同名 + latest.yml 配对 → 校验通过」 |
+| Windows 产物校验 | 同一产物上验证：NSIS 载荷架构识别、blockmap 同批、`--allow-unsigned` 降级、
+退出码 0/1 区分（用 `--expect-version` 传错版本确认会 FAIL） |
 
 **未验证**：
 
-- Windows 实际打包（需 Windows 宿主 + 真实原生模块）。
-- `verify-win-artifact.mjs` 的 Authenticode 分支（需 Windows + 真实签名；非 Windows 上会标 `SKIP`，不算通过）。
+- 含**原生模块**的 Windows 打包（需 Windows 宿主 + 真实 ABI 切换脚本）。
+- 真实证书签名的 Authenticode 分支（当前只在未签名产物上验过 `NotSigned` 路径、
+  `Get-AuthenticodeSignature` 的 JSON 解析链路）。
 - SimplySign 预热流程（需 Win 打包机 + 真实 PIN 交互）。
 
 skill 中标注为「无法验证时须如实告知」。

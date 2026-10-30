@@ -25,6 +25,40 @@ prebuild 的（如 `bufferutil`，其 `prebuilds/win32-x64/bufferutil.node` 命�
 > 结论：发布用途的 Windows 包，一律在 Windows 宿主构建。构建脚本应在非 Windows 宿主上
 > **快速失败并说明原因**，而不是"试一下"。
 
+### 1.1 `node_modules` 也是平台相关的（常被忽略）
+
+把 `node_modules` 从 macOS 机器整体拷到 Windows 后，应用能跑、`node -v` 正常，
+但所有 npm 脚本都失效：
+
+```
+> electron-builder --win
+'electron-builder' 不是内部或外部命令，也不是可运行的程序
+```
+
+两处平台绑定的东西：
+
+| 位置 | macOS 形态 | Windows 需要 |
+|---|---|---|
+| `node_modules/.bin/*` | 无扩展名符号链接 | `*.cmd` + `*.ps1` |
+| `node_modules/electron/dist/` | `Electron.app/...` | `electron.exe`（缺失则 `npm start`、冒烟测试都不可用） |
+
+补充一个容易忽略的细节：脚本里 `spawnSync('npm', args, { shell: false })` 在 Windows 上
+**必然 ENOENT**（libuv 只给命令名补 `.exe`，不认 PATHEXT；`npm` 实际是 `npm.cmd`），
+而 Node ≥18.20 出于 CVE-2024-27980 又禁止无 shell 执行 `.cmd` —— 所以必须 `shell: true`，
+并且要知道 shell 模式下 Node **不会**给参数加引号，带空格的参数要自行包引号。
+
+| 诉求 | 做法 |
+|---|---|
+| 只打包 | `node node_modules/electron-builder/cli.js --win --publish never` |
+| 要 `npm start` / 冒烟 / 长期用 | 在 Windows 上 `npm ci`（会重写 `node_modules`，**mac 侧那份随即失效**） |
+
+判断当前 `node_modules` 是不是本平台装的：
+
+```bash
+ls node_modules/.bin | grep -c '\.cmd$'    # Windows 上为 0 即说明是拷来的
+ls node_modules/electron/dist/electron.exe # 缺失同上
+```
+
 ---
 
 ## 2. 十阶段流水线
@@ -80,6 +114,9 @@ node -e "for (const m of Object.keys(require('./package.json').dependencies)) { 
 典型例子：`bufferutil` / `utf-8-validate` 即使自带 `prebuilds/win32-x64/*.node`，也属于这一类
 ——`prebuilds` 目录存在不等于会被使用，`@electron/rebuild` 不读它。
 
+> 与本轮新增的 §1.1 不是同一件事：§1.1 讲 `.bin` shim 缺失导致 `npm run` 失效；
+> 本节讲**确实需要编译器**时如何判定，两者都可能出现，不可互相替代。
+
 ---
 
 ## 3. 配置面（`package.json#build`）
@@ -97,6 +134,19 @@ node -e "for (const m of Object.keys(require('./package.json').dependencies)) { 
 | `win.target` | `nsis` / `portable` / `msi` | 多目标会改变产物与清单结构 |
 | `win.artifactName` | 产物命名 | 发布脚本常按 `*setup*.exe` glob，改名要同步 |
 | `win.signtoolOptions` | 签名参数 | 见 §5；旧版可能在 `win` 顶层，需按实际版本确认 |
+| `author` | exe 的 `CompanyName`、NSIS 卸载项发布者、`LegalCopyright` 主体 | **缺失不报错**，只会回落 `GitHub, Inc.`（§3.0） |
+
+### 3.0 `author` 为什么不能省
+
+electron-builder 用 `package.json#author` 生成 `--set-version-string CompanyName` 与
+`LegalCopyright`；没有就沿用 Electron 自带的 `GitHub, Inc.`，构建日志只有一行：
+
+```
+• author is missed in the package.json  appPackageFile=.../package.json
+```
+
+后果：控制面板「卸载程序」里的发布者、exe 属性里的公司名都是错的。
+补 `author` 必须在打包**之前**，因为该值会进 rcedit 命令行；事后单改 exe 会与 NSIS 侧不一致。
 
 ### 3.1 `${os}` 宏的取值来源
 
@@ -242,6 +292,37 @@ signtool sign /sha1 "<THUMBPRINT>" /fd sha256 `
 
 ---
 
+### 5.7 打包阶段的 `rcedit` 锁定（与签名无关，但同样卡在签名前）
+
+**不属于签名失败**，却常被误判成证书问题：写入 exe 版本资源时失败。
+
+```
+errorOut=Fatal error: Unable to commit changes
+command='...\winCodeSign-2.6.0\rcedit-x64.exe' '...\release\win-unpacked\MyApp.exe'
+        --set-version-string FileDescription '...' --set-icon '...'
+```
+
+判断依据：
+
+| 观察 | 结论 |
+|---|---|
+| 等 8~30 秒后同一条命令手动重跑必成功 | 实时防护瞬时独占（火绒 / 电脑管家 / Defender） |
+| 换 rcedit 版本、换参数、换路径都复现 | 同上，与 rcedit 自身无关 |
+| 日志里连 `signtool` 都没出现 | 确实与证书/签名无关 |
+
+恢复顺序（不要整包重跑）：
+
+1. 从日志抠出 rcedit **原始命令行**（按单引号分段，保留空参数，兼容中文与空格路径）
+2. `[0, 8, 8, 10, 12, 15, 20, 25]` 秒退避重试；每次先 `open(exe,'r+')` 探测占用
+3. `electron-builder --win --prepackaged <outputDir>/win-unpacked` 续跑 nsis/zip
+
+> 整包重跑会重新拷贝 exe，必然再触发一次锁 —— 这就是"重跑三次都失败"的由来。
+> 更彻底的解法：把项目目录加入安全软件信任区。
+
+`build.mjs` 在 `--platform win` 时已内置上述三步；产物元数据自检见 §7 与 §3.0。
+
+---
+
 ## 6. 更新元数据
 
 Windows 的清单是 `latest.yml`（macOS 是 `latest-mac.yml`）。由 builder 自动生成，包含：
@@ -280,22 +361,74 @@ node <SKILL_DIR>/scripts/verify-win-artifact.mjs --dir release --expect-version 
 | 4 | 产物体积 == 清单 size | 产物被替换或清单过期 |
 | 5 | 产物 sha512 == 清单 sha512 | **签名晚于元数据 / 混入旧批次** |
 | 6 | `path` == `files[0].url` | 清单内部不一致 |
-| 7 | PE 头合法 + 架构符合预期 | 误打 32 位 / arm64 |
+| 7 | PE 头合法 + 架构符合预期 | 误打 32 位 / arm64（NSIS 包看载荷，见 §7.1） |
 | 8 | blockmap 存在且与 exe 同批 | 差量更新不可用；或产物混批 |
 | 9 | Authenticode 有效 + 含时间戳 | 未签名 / 证书链问题 / 证书过期后失效 |
 
 第 9 项：Windows 上走 `Get-AuthenticodeSignature`；其他平台优先 `osslsigncode verify`，
 都没有则标 `SKIP`（**不算通过**）。
 
-退出码：`0` 全部通过；`1` 有失败项；`2` 参数/环境错误。
+> Windows 宿主上「PowerShell 没跑起来」（执行策略 / AppLocker / 组策略拦截）**记 FAIL**，
+> 不记 SKIP —— 否则签名分支等于从未执行，却仍然 `exit 0`。
 
-**不经脚本时的 PE 架构手工核验**（`0x8664` = x64 / `0x14c` = x86 / `0xaa64` = arm64）：
+若项目本就决定不签名（`identity: null` / 内部工具），加 `--allow-unsigned`：
+`NotSigned` 记 SKIP 而不是 FAIL，避免「整份报告恒为失败」导致其他项被忽略。
+未签名产物必须在报告里写明「首次安装与每次升级都会被 SmartScreen 拦截」。
+
+退出码：`0` 无 FAIL；`1` 有失败项；`2` 参数/环境错误；`3` `--strict` 下存在 SKIP。
+
+> 默认 `exit 0` 只代表「没有 FAIL」，不代表「可分发」。CI 发布门禁请加 `--strict`，
+> 让 SKIP 也变成非 0，避免「签名没验成但流水线全绿」。
+
+### 7.1 PE 架构：NSIS 安装包恒为 x86 引导
+
+`makensis` 生成的安装器 stub **固定是 32 位 PE**，与载荷架构无关。所以对
+`*-Setup-*.exe` 直接比对 `--expect-arch x64` 必然误报：
+
+```
+✗ PE 架构：MyApp-Setup-1.2.3.exe  — 实际 x86 ≠ 期望 x64   ← 假阳性
+```
+
+脚本处理方式：识别 firstheader 里的 `NullsoftInst` 标记 → 判定为 NSIS 引导 →
+改为读取 `<dir>/win-unpacked`（或 `../win-unpacked`）里体积最大的 exe 作为载荷，
+校验它的架构。输出形如：
+
+```
+✓ PE 架构：MyApp-Setup-1.2.3.exe  — NSIS 引导 x86（正常）+ 载荷 x64
+```
+
+收尾目录（如 `dist/package`）通常不含 unpacked 目录时，退化为
+「载荷 exe 未找到，架构未复核」——**不判失败**，但要人工在 `win-unpacked` 上补一次。
+
+> 顺带：ASCII 改名收尾时 `.blockmap` 必须跟着改同名。`latest.yml` 不列 blockmap，
+> 漏拷不会报错，只会让 electron-updater 静默退化为全量下载。
+
+**不经脚本时的 PE 架构手工核验**（`0x8664` = x64 / `0x14c` = x86 / `0xaa64` = arm64）。
+安装包看载荷 exe，原生模块看 `.node`（asar 解包后的那份）：
 
 ```bash
+# 安装包 / exe
+node -e "const b=require('fs').readFileSync('<path>/MyApp.exe');console.log('machine=0x'+b.readUInt16LE(b.readUInt32LE(0x3c)+4).toString(16))"
+
+# 原生模块（示例：better-sqlite3）
 node -e "const b=require('fs').readFileSync('<path>/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node');console.log('machine=0x'+b.readUInt16LE(b.readUInt32LE(0x3c)+4).toString(16))"
 ```
 
-### 7.1 无法脚本化的两项
+`.node` 架构与安装包不一致时，安装成功但启动即崩（见 §2.2）。
+
+### 7.2 校验脚本自身的可信度（真实事故）
+
+曾把入口判定写成 `resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)`：
+macOS 上正常，Windows 上 `pathname` 是 `/C:/…`，永不相等 → `main()` 不跑、`exit 0`，
+于是「校验通过」= 「什么都没校验」。
+
+规则：
+
+- 入口判定用 `fileURLToPath`（Windows 再 `realpathSync` + 小写归一）
+- 成功路径必须有输出；拿不到预期输出按失败处理
+- 新写/改写的校验脚本，**先用已知不合格的产物跑一遍**确认会 FAIL
+
+### 7.3 无法脚本化的两项
 
 | 项 | 为什么 | 建议 |
 |---|---|---|
@@ -310,6 +443,13 @@ node -e "const b=require('fs').readFileSync('<path>/app.asar.unpacked/node_modul
 |---|---|---|
 | `After Private Key filter, 0 certs were left` | PFX 缺私钥，或云签名器 KSP 未就绪 | 见 §5.4 |
 | 构建卡在 `Submitting digest for signing...` | 等待 PIN / 手机确认 | 开 PIN 缓存并预热（§5.3） |
+| `Fatal error: Unable to commit changes`（rcedit） | exe 刚写入被实时防护瞬时独占 | 退避补写 + `--prepackaged` 续跑（§5.7） |
+| `'electron-builder' 不是内部或外部命令` / `npx` 失效 | `node_modules` 跨平台拷贝，`.bin` 无 `.cmd` shim | `node node_modules/electron-builder/cli.js`；长期解法 `npm ci`（§1.1） |
+| `npm run build:win` 报 `Missing script` | 打包脚本只在部分分支存在 | 改用裸 builder，收尾照做（SKILL.md §5.7） |
+| 安装包发布者显示 `GitHub, Inc.` | `package.json` 缺 `author` | 补 `author` 后重建（§3.0） |
+| 校验脚本报"通过"但无任何输出 / 秒退 | 入口判定跨平台 bug，`main()` 未执行 | 用 `fileURLToPath`；无输出按失败（§7.2） |
+| 校验报 `PE 架构：实际 x86 ≠ 期望 x64` | NSIS 引导程序恒为 32 位 | 看载荷 exe；脚本已识别 `NullsoftInst`（§7.1） |
+| 差量更新失效 / 每次都全量下载 | 收尾改名后 `.blockmap` 未同步改同名 | 改名时一并改 blockmap（§7.1） |
 | `npm run dist:win` 在 mac 上失败 | 交叉构建，原生模块拒绝 | 改用 Windows 宿主（§1） |
 | 交叉构建后本机应用起不来 | 原生二进制被换成 PE | 重建对应 ABI（项目脚本） |
 | 构建成功但客户端更新报哈希错误 | 签名晚于 blockmap/latest.yml | 让 builder 签名，删掉后置重签（§5.1） |
