@@ -2,7 +2,7 @@
 # verify-artifact.sh —— 产物验证：签名 / 公证 / staple / 清单完整性 / 线上更新源
 #
 # 用法：
-#   verify-artifact.sh <dmg|app|zip 路径># 验单个 .app 或 .dmg 的签名与公证
+#   verify-artifact.sh <dmg|app|zip 路径>      # 验单个 .app 或 .dmg 的签名与公证
 #   verify-artifact.sh --manifest <latest*.yml> --dir <产物目录>   # 验清单与产物配对
 #   verify-artifact.sh --feed <更新源 URL> [期望版本]     # 验线上更新源 + 诊断不可达原因
 #
@@ -95,39 +95,16 @@ if [ "$1" = "--manifest" ]; then
   [ -f "$MANIFEST" ] || die "清单不存在: $MANIFEST"
   [ -n "$DIR" ] || die "需要 --dir <产物目录>"
   [ -d "$DIR" ] || die "产物目录不存在: $DIR"
-  # 后续子进程会切换工作目录（为require 项目 js-yaml），先固化为绝对路径
+  # 固化为绝对路径：manifest-cli 可能在任意 cwd 下被调用
   MANIFEST="$(cd "$(dirname "$MANIFEST")" && pwd)/$(basename "$MANIFEST")"
   DIR="$(cd "$DIR" && pwd)"
-  PROJECT_ROOT="$(dirname "$DIR")"
 
   dim "校验清单 $MANIFEST 与目录 $DIR 的配对"
-  # 用 Python 校验（需 pyyaml）；没装则回退到 node +项目自带的 js-yaml
-  # 说明：Electron 项目几乎都装了 js-yaml（electron-builder 依赖），故优先 node
-  if command -v node >/dev/null 2>&1 && NODE_MOD=$(cd "$DIR/.." 2>/dev/null && node -e 'require.resolve("js-yaml");console.log("ok ")' 2>/dev/null) && [ "$NODE_MOD" = "ok " ]; then
-    dim "  （使用 node + js-yaml 校验）"
-    ( cd "$DIR/.." && node -e '
-      const fs=require("fs"),path=require("path"),crypto=require("crypto"),yaml=require("js-yaml");
-      const mp=process.argv[1],dp=process.argv[2];
-      const m=yaml.load(fs.readFileSync(mp,"utf8"));
-      if(!m||!Array.isArray(m.files)||!m.files.length){console.log("✗ 清单缺少 files 数组");process.exit(1);}
-      let fail=0;
-      for(let i=0;i<m.files.length;i++){
-        const f=m.files[i];
-        for(const k of ["url","sha512","size"]){
-          if(!f[k]){console.log(`✗ files[${i}] 缺少 ${k}`);fail=1;}
-        }
-        if(!f.url) continue;
-        const name=path.basename(f.url), p=path.join(dp,name);
-        if(!fs.existsSync(p)){console.log(`✗ ${name} 产物缺失`);fail=1;continue;}
-        const b=fs.readFileSync(p);
-        if(b.length!==f.size){console.log(`✗ ${name} 实际 ${b.length} 字节 ≠ 清单 ${f.size}`);fail=1;continue;}
-        const h=crypto.createHash("sha512").update(b).digest("base64");
-        if(h!==f.sha512){console.log(`✗ ${name} sha512 与清单不一致`);fail=1;continue;}
-        console.log(`✓ ${name}  ${Math.round(b.length/1048576)}MB  sha512 匹配`);
-      }
-      if(m.path){const pn=path.basename(m.path);if(!fs.existsSync(path.join(dp,pn)))console.log(`! path 字段指向的主产物不在目录: ${pn}`);}
-      process.exit(fail);
-    ' "$MANIFEST" "$DIR" )
+  # 统一走 scripts/manifest-cli.mjs：零第三方依赖，内置解析器只认 electron-updater 固定形态
+  SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if command -v node >/dev/null 2>&1 && [ -f "$SELF_DIR/manifest-cli.mjs" ]; then
+    dim "  （使用 node + 内置解析器校验）"
+    node "$SELF_DIR/manifest-cli.mjs" verify --manifest "$MANIFEST" --dir "$DIR"
     exit $?
   elif command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null; then
     python3 - "$MANIFEST" "$DIR" <<'PY'
@@ -160,8 +137,8 @@ sys.exit(fail)
 PY
     exit $?
   else
-    bad "无 YAML 解析能力：项目未安装 js-yaml，系统Python 也无 pyyaml"
-    dim "  解决：npm i -D js-yaml  或  pip3 install pyyaml"
+    bad "无清单校验能力：找不到 node（scripts/manifest-cli.mjs），系统 Python 也无 pyyaml"
+    dim "  解决：安装 Node.js（推荐，零依赖） 或  pip3 install pyyaml"
     exit 1
   fi
 fi

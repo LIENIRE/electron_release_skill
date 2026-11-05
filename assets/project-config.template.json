@@ -14,7 +14,7 @@
   },
 
   "build": {
-    "_说明": "覆盖 probe.mjs 探测到的默认值；不确定的项可留 null",
+    "_说明": "build.mjs 实际读取本文件的 build.outputDir / build.command；不确定的项可留 null",
     "command": null,
     "outputDir": null,
     "targets": {
@@ -48,7 +48,7 @@
     "entitlementsInherit": null,
 
     "windows": {
-      "_说明": "证书三选一。certificateSha1 一旦设置即独占来源，不回退 PFX/WIN_CSC_LINK。publisherName 必须与证书 Subject 完全一致（建议完整 DN）。",
+      "_说明": "证书三选一。优先级：命令行 > SIGN_SHA1 环境变量 > 本文件 > package.json#build.win > 证书存储里唯一可用证书。certificateSha1 一旦设置即独占来源，不回退 PFX/WIN_CSC_LINK。publisherName 必须与证书 Subject 完全一致（建议完整 DN）。method=none 表示明确不签名（build.mjs 会跳过“未签名即失败”的守卫）。",
       "method": null,
       "_method取值": ["certificateSha1", "certificateSubjectName", "certificateFile", "none"],
       "certificateSha1": null,

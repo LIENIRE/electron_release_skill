@@ -15,6 +15,8 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 
+import { loadProjectConfig } from './lib/project-config.mjs';
+
 const args = process.argv.slice(2).filter((a) => a !== '--json');
 const asJson = process.argv.includes('--json');
 const root = resolve(args[0] || process.cwd());
@@ -125,7 +127,7 @@ const pkgPath = join(root, 'package.json');
 if (!existsSync(pkgPath)) fail(`未找到 package.json：${pkgPath}`);
 let pkg;
 try {
-  pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  pkg = JSON.parse(readFileSync(pkgPath, 'utf8').replace(/^\uFEFF/, ''));
 } catch (e) {
   fail(`package.json 解析失败：${e.message}`);
 }
@@ -153,6 +155,14 @@ if (!pkg.build && builderYml) {
 } else if (!pkg.build && !builderYml) {
   configSource = null; // 可能是 forge / packager，或尚未配置
 }
+
+// ---------- 项目级配置（可选） ----------
+// `.electron-release.json` 由 build.mjs / preflight-win-sign.mjs 实际读取；
+// probe 只展示它覆盖了哪些关键项，避免「文档说有、脚本没读」的假象。
+const projectConfig = loadProjectConfig(root);
+const cfg = projectConfig.config || {};
+const cfgBuild = cfg.build || {};
+const cfgWin = (cfg.signing && cfg.signing.windows) || {};
 
 // ---------- forge / packager 分支 ----------
 const isForge = '@electron-forge/cli' in allDeps;
@@ -223,6 +233,11 @@ const image = {
         : null,
   },
   configSource,
+  projectConfig: {
+    path: projectConfig.path,
+    present: projectConfig.present,
+    error: projectConfig.error || null,
+  },
   targets: (() => {
     const b = build || {};
     const norm = (t) => (Array.isArray(t) ? t : t ? [t] : []).filter(Boolean).map((x) => (typeof x === 'string' ? x : x.target));
@@ -233,7 +248,7 @@ const image = {
     if (b.linux) t.linux = norm(b.linux.target ?? b.linux.targets);
     return t;
   })(),
-  outputDir: (build && build.directories && build.directories.output) || build?.outputDir || 'dist',
+  outputDir: cfgBuild.outputDir || (build && build.directories && build.directories.output) || build?.outputDir || 'dist',
   filesWhitelist: build?.files || null,
   publish: build?.publish || null,
   icons: {
@@ -249,22 +264,27 @@ const image = {
     windows: (() => {
       const w = build?.win || null;
       const so = w?.signtoolOptions || {};
-      const sha1 = so.certificateSha1 ?? w?.certificateSha1 ?? null;
-      const subject = so.certificateSubjectName ?? w?.certificateSubjectName ?? null;
-      const file = so.certificateFile ?? w?.certificateFile ?? null;
-      const publisherName = so.publisherName ?? w?.publisherName ?? null;
-      const timestampServer = so.rfc3161TimeStampServer ?? so.timeStampServer ?? w?.rfc3161TimeStampServer ?? null;
+      // 项目级配置优先级高于 package.json（与 build.mjs / preflight 实际读取顺序一致）
+      const sha1 = cfgWin.certificateSha1 ?? so.certificateSha1 ?? w?.certificateSha1 ?? null;
+      const subject = cfgWin.certificateSubjectName ?? so.certificateSubjectName ?? w?.certificateSubjectName ?? null;
+      const file = cfgWin.certificateFile ?? so.certificateFile ?? w?.certificateFile ?? null;
+      const publisherName = cfgWin.publisherName ?? so.publisherName ?? w?.publisherName ?? null;
+      const timestampServer =
+        cfgWin.timestampServer ?? so.rfc3161TimeStampServer ?? so.timeStampServer ?? w?.rfc3161TimeStampServer ?? null;
       // 只有 publisherName / 时间戳、没有证书选择方式时，证书很可能由 CLI 或 WIN_CSC_LINK 传入
       const hasHints = !!publisherName || !!timestampServer;
-      const method = sha1
-        ? 'certificateSha1（证书存储；独占来源，不回退 PFX）'
-        : subject
-          ? 'certificateSubjectName（证书存储）'
-          : file
-            ? 'certificateFile（PFX）'
-            : hasHints
-              ? '未在配置中指定证书（可能经 CLI 参数或 WIN_CSC_LINK 传入）'
-              : '未配置（可能不签名）';
+      const method = cfgWin.method === 'none'
+        ? 'none（.electron-release.json 明确不签名）'
+        : sha1
+          ? 'certificateSha1（证书存储；独占来源，不回退 PFX）'
+          : subject
+            ? 'certificateSubjectName（证书存储）'
+            : file
+              ? 'certificateFile（PFX）'
+              : hasHints
+                ? '未在配置中指定证书（可能经 CLI 参数、SIGN_SHA1 或 WIN_CSC_LINK 传入）'
+                : '未配置（可能不签名）';
+      const cloudSigner = cfgWin.cloudSigner || null;
       const nsis = w?.nsis || {};
       return {
         method,
@@ -273,6 +293,13 @@ const image = {
         certificateFile: file,
         publisherName,
         timestampServer,
+        cloudSigner: cloudSigner
+          ? {
+              enabled: !!cloudSigner.enabled,
+              prewarm: !!cloudSigner.prewarm,
+              requireLoggedIn: cloudSigner.requireLoggedIn !== false,
+            }
+          : null,
         nsis: {
           oneClick: nsis.oneClick ?? null,
           perMachine: nsis.perMachine ?? null,
@@ -300,6 +327,11 @@ if (!asJson) {
   console.log(`发布者      ${p.author || '(未声明) ← exe CompanyName 与卸载项发布者会回落 GitHub, Inc.'}`);
   console.log(`打包工具    ${image.detection.buildTools.join(', ') || '(无)'}`);
   console.log(`配置来源    ${configSource || '(无构建配置)'}`);
+  if (image.projectConfig.present) {
+    console.log(
+      `项目配置    ${image.projectConfig.path}${image.projectConfig.error ? '  ← 解析失败：' + image.projectConfig.error : ''}`
+    );
+  }
   console.log(`目标        ${Object.entries(image.targets).map(([k, v]) => `${k}: ${[].concat(v).join('/')}`).join('  ') || '(未声明)'}`);
   console.log(`输出目录    ${image.outputDir}`);
   console.log(`发布源      ${image.publish ? JSON.stringify(image.publish) : '(未配置)'}`);
@@ -317,6 +349,9 @@ if (!asJson) {
       : (nsis.length ? nsis.join(' / ') : '(显式配置，无特殊项)');
     console.log(`NSIS        ${nsisNote}`);
     if (w.timestampServer) console.log(`时间戳      ${w.timestampServer}`);
+    if (w.cloudSigner?.enabled) {
+      console.log(`云签名器    ${w.cloudSigner.prewarm ? '已启用（构建前预热）' : '已启用（未配置预热）'}`);
+    }
   }
   console.log(`凭据(已设)  ${image.credentialsInEnv.length ? image.credentialsInEnv.map((c) => c.key).join(', ') : '(无)'}`);
   if (image.artifacts.length) {

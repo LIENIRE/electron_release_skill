@@ -24,6 +24,15 @@ fi
 [ -f "$ROOT/package.json" ] || { echo "✗ 未找到 package.json：$ROOT" >&2; exit 2; }
 
 node -e '' 2>/dev/null && HAVE_NODE=1 || HAVE_NODE=0
+
+# 走到这里却还有 node，说明上面的 exec 没生效 —— probe.mjs 缺失。
+# 必须显式失败：静默 exit 0 会被上层当成「探测通过」（SKILL.md §0 铁律 7 / §5.12）。
+if [ "$HAVE_NODE" = "1" ]; then
+  echo "✗ node 可用，但同目录缺少 probe.mjs：$DIR/probe.mjs" >&2
+  echo "提示：确认 scripts/ 目录完整，或用 install.sh --copy 重新安装本 skill" >&2
+  exit 2
+fi
+
 if [ "$HAVE_NODE" = "0" ]; then
   #无 node：用 grep/sed 提取，能力有限但能识别关键配置
   has_dep() { grep -q "\"$1\"" "$ROOT/package.json" && echo 1 || echo 0; }

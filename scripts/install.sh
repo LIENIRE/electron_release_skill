@@ -2,7 +2,7 @@
 # install.sh —— 把本 skill 安装/链接到各 AI agent 的技能目录
 #
 # 用法：
-#   ./install.sh# 自动探测本机已装的 agent 并全部链接
+#   ./install.sh                          # 自动探测本机已装的 agent 并全部链接
 #   ./install.sh --link claude codex      # 只链接指定 agent
 #   ./install.sh --copy                   # 用复制而非软链（Windows/跨机场景）
 #   ./install.sh --list                   # 只显示本机支持的 agent 与检测状态
@@ -17,7 +17,7 @@ NAME="$(basename "$SRC")"
 MODE="link"
 TARGETS=()
 
-# agent id | 全局目录 | 项目级目录 | 显示名
+# id | 全局目录 | 显示名
 AGENTS=(
   "agents|$HOME/.agents/skills|通用 agents 规范"
   "claude|$HOME/.claude/skills|Claude Code"
@@ -26,9 +26,10 @@ AGENTS=(
   "windsurf|$HOME/.codeium/windsurf/skills|Windsurf"
   "gemini|$HOME/.gemini/skills|Gemini CLI"
   "copilot|$HOME/.config/github-copilot/skills|GitHub Copilot CLI"
+  "workbuddy|$HOME/.workbuddy/skills|WorkBuddy"
 )
 
-usage(){ sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0; }
+usage(){ sed -n '2,11p' "$0" | sed 's/^# \?//'; exit 0; }
 
 while [ $# -gt 0 ]; do
   case "$1" in

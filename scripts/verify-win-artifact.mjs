@@ -30,12 +30,14 @@
  *   - NSIS 安装包本体恒为 32 位引导程序，架构要看 win-unpacked 里的载荷 exe
  */
 
-import { createHash } from 'node:crypto';
 import { readFile, stat, readdir } from 'node:fs/promises';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+
+import { runPowerShell } from './lib/powershell.mjs';
+import { parseManifest, sha512File } from './lib/manifest.mjs';
 
 // ---------------------------------------------------------------- CLI
 
@@ -48,6 +50,7 @@ function parseArgs(argv) {
     expectArch: null,
     maxBlockmapSkew: 600,
     json: false,
+    jsonOut: null,
     allowUnsigned: false,
     strict: false,
   };
@@ -58,6 +61,7 @@ function parseArgs(argv) {
     '--expect-version',
     '--expect-arch',
     '--max-blockmap-skew',
+    '--json-out',
   ]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -94,6 +98,7 @@ function parseArgs(argv) {
     if (name === '--expect-version') opts.expectVersion = value;
     if (name === '--expect-arch') opts.expectArch = value;
     if (name === '--max-blockmap-skew') opts.maxBlockmapSkew = Number(value);
+    if (name === '--json-out') opts.jsonOut = value;
   }
   return opts;
 }
@@ -110,6 +115,7 @@ function printUsage() {
   --allow-unsigned          明确接受未签名产物：NotSigned 记为 SKIP 而非 FAIL
   --strict                  有 SKIP 即视为未通过（CI 发布门禁用，退出码 3）
   --json                    输出 JSON
+  --json-out <路径>         同时把 JSON 写入文件（受限沙箱里无法捕获 stdout 时用）
 
 退出码：0 无 FAIL；1 有 FAIL；2 参数/环境错误；3 --strict 下存在 SKIP。
 `);
@@ -137,79 +143,9 @@ function skip(name, detail) {
 
 // ---------------------------------------------------------------- latest.yml 解析
 
-/**
- * 只解析 electron-updater 清单的固定形态，避免引入 YAML 依赖。
- * 支持：
- *   version: 1.2.3
- *   files:
- *     - url: a.exe
- *       sha512: xxx
- *       size: 123
- *   path: a.exe
- *   sha512: xxx
- *   releaseDate: '...'
- */
-export function parseManifest(text) {
-  const out = { version: null, path: null, sha512: null, files: [], releaseDate: null };
-  const lines = text.split(/\r?\n/);
-  let inFiles = false;
-  let current = null;
-
-  const unquote = (v) => {
-    const t = v.trim();
-    if (
-      (t.startsWith('"') && t.endsWith('"')) ||
-      (t.startsWith("'") && t.endsWith("'"))
-    ) {
-      return t.slice(1, -1);
-    }
-    return t;
-  };
-
-  for (const raw of lines) {
-    if (!raw.trim() || raw.trim().startsWith('#')) continue;
-    const indent = raw.length - raw.trimStart().length;
-    const line = raw.trim();
-
-    if (/^files:\s*$/.test(line)) {
-      inFiles = true;
-      continue;
-    }
-
-    if (inFiles && /^-\s+/.test(line)) {
-      current = {};
-      out.files.push(current);
-      const rest = line.replace(/^-\s+/, '');
-      const m = /^(\w+):\s*(.+)$/.exec(rest);
-      if (m) current[m[1]] = unquote(m[2]);
-      if (m && m[1] === 'size') current.size = Number(current.size);
-      continue;
-    }
-
-    if (inFiles && indent >= 2 && current) {
-      const m = /^(\w+):\s*(.+)$/.exec(line);
-      if (m) {
-        current[m[1]] = unquote(m[2]);
-        if (m[1] === 'size') current.size = Number(current.size);
-      }
-      continue;
-    }
-
-    if (indent === 0) {
-      inFiles = false;
-      const m = /^(\w+):\s*(.+)$/.exec(line);
-      if (!m) continue;
-      const key = m[1];
-      const value = unquote(m[2]);
-      if (key === 'version') out.version = value;
-      if (key === 'path') out.path = value;
-      if (key === 'sha512') out.sha512 = value;
-      if (key === 'releaseDate') out.releaseDate = value;
-    }
-  }
-
-  return out;
-}
+// 实现已收敛到 lib/manifest.mjs（build.mjs / manifest-cli.mjs 共用同一份）。
+// 这里保留具名导出，避免外部按旧路径 import 时断裂。
+export { parseManifest };
 
 // ---------------------------------------------------------------- PE 解析
 
@@ -300,31 +236,17 @@ async function findPayloadExe(dir) {
 
 // ---------------------------------------------------------------- Authenticode
 
-function probeCommand(cmd) {
-  const r = spawnSync(cmd, ['--version'], { encoding: 'utf8', timeout: 10000 });
-  return !r.error;
-}
-
 function verifyAuthenticodeWindows(exePath) {
-  // 注意：这里必须用**多行**脚本并避开「hashtable 字面量里写 if 语句」——
-  //   ① 原实现用 '; ' 把多行 join 成一行，会产出 `[ordered]@{; Status = ...`，PS 直接语法报错；
-  //   ② Windows PowerShell 5.1 不允许 `@{ k = if (...) {...} else {...} }`，必须先把值算进变量。
-  // 用 -EncodedCommand（UTF-16LE base64）传参，可彻底绕开中文路径与引号转义问题。
+  // 用 -EncodedCommand（UTF-16LE base64）传参，彻底绕开中文路径与引号转义。
+  // 结果经临时文件取回（runPowerShell），不在受限沙箱里因管道 EPERM 而误报失败。
   const literal = exePath.replace(/'/g, "''");
-  const script = [
-    `$ErrorActionPreference = 'Stop'`,
-    `try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}`,
-    `try {`,
-    `  $s = Get-AuthenticodeSignature -LiteralPath '${literal}'`,
-    `} catch {`,
-    `  '{"Status":"Error","StatusMessage":"' + ($_.Exception.Message -replace '"','\\"') + '","Subject":"","Thumbprint":"","TimestampSubject":""}'`,
-    `  exit 0`,
-    `}`,
+  const body = [
+    `$s = Get-AuthenticodeSignature -LiteralPath '${literal}'`,
     `$subject = ''`,
     `$thumb = ''`,
     `$ts = ''`,
-    `if ($s.SignerCertificate -ne $null) { $subject = $s.SignerCertificate.Subject; $thumb = $s.SignerCertificate.Thumbprint }`,
-    `if ($s.TimeStamperCertificate -ne $null) { $ts = $s.TimeStamperCertificate.Subject }`,
+    `if ($s.SignerCertificate -ne $null) { $subject = [string]$s.SignerCertificate.Subject; $thumb = [string]$s.SignerCertificate.Thumbprint }`,
+    `if ($s.TimeStamperCertificate -ne $null) { $ts = [string]$s.TimeStamperCertificate.Subject }`,
     `$out = [ordered]@{`,
     `  Status = [string]$s.Status`,
     `  StatusMessage = [string]$s.StatusMessage`,
@@ -332,22 +254,19 @@ function verifyAuthenticodeWindows(exePath) {
     `  Thumbprint = $thumb`,
     `  TimestampSubject = $ts`,
     `}`,
-    `$out | ConvertTo-Json -Compress`,
+    `$result = $out | ConvertTo-Json -Compress`,
   ].join('\n');
 
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  const r = spawnSync(
-    'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-    { encoding: 'utf8', timeout: 60000, windowsHide: true }
-  );
-  if (r.error) return { ok: false, reason: `PowerShell 调用失败：${r.error.message}` };
+  const r = runPowerShell(body, { timeout: 60000 });
+  if (!r.ok) return { ok: false, reason: r.error };
   const stdout = (r.stdout || '').trim();
   if (!stdout) {
-    return { ok: false, reason: `PowerShell 无输出（退出码 ${r.status}）：${(r.stderr || '').trim().split('\n')[0] || '未知'}` };
+    return { ok: false, reason: `PowerShell 无输出（退出码 ${r.status}）` };
   }
   try {
-    return { ok: true, data: JSON.parse(stdout.split(/\r?\n/).pop()) };
+    const data = JSON.parse(stdout.split(/\r?\n/).pop());
+    if (data && data.error) return { ok: false, reason: String(data.error) };
+    return { ok: true, data };
   } catch {
     return { ok: false, reason: `返回值无法解析：${stdout.slice(0, 200)}` };
   }
@@ -369,10 +288,6 @@ function verifyAuthenticodeOssl(exePath) {
 }
 
 // ---------------------------------------------------------------- 主流程
-
-function sha512File(path) {
-  return readFile(path).then((b) => createHash('sha512').update(b).digest('base64'));
-}
 
 async function findArtifactDir(explicit) {
   if (explicit) return resolve(explicit);
@@ -588,11 +503,20 @@ function finish(opts) {
   const skipped = results.filter((r) => r.status === 'SKIP');
   // 默认语义：exit 0 = 无 FAIL（SKIP 需人工复核）；--strict 下 SKIP 也算未通过 → 3
   const code = failed.length ? 1 : opts.strict && skipped.length ? 3 : 0;
+  const payload = { ok: code === 0, exitCode: code, failed: failed.length, skipped: skipped.length, strict: !!opts.strict, results };
+
+  // --json-out：供 build.mjs 在受限沙箱（stdout 管道被禁）里读取结果
+  if (opts.jsonOut) {
+    try {
+      writeFileSync(opts.jsonOut, JSON.stringify(payload, null, 2), 'utf8');
+    } catch (e) {
+      console.error(`无法写入 --json-out 文件：${opts.jsonOut}（${e.message}）`);
+      process.exit(2);
+    }
+  }
 
   if (opts.json) {
-    console.log(
-      JSON.stringify({ ok: code === 0, exitCode: code, failed: failed.length, skipped: skipped.length, strict: !!opts.strict, results }, null, 2)
-    );
+    console.log(JSON.stringify(payload, null, 2));
   } else {
     console.log('');
     for (const r of results) {

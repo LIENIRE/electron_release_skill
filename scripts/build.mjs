@@ -12,20 +12,38 @@
  *   --platform mac|win|linux|all   构建平台（默认 mac）
  *   --out <目录>                   收尾产物目录（默认 <outputDir>/package）
  *   --skip-tests                   跳过单元测试
- *   --no-finalize只构建，不做收尾与校验
+ *   --skip-build                   跳过测试与构建，只对已有产物做收尾 + 校验
+ *   --no-finalize                  只构建，不做收尾与校验
+ *   --no-verify                    收尾后不跑产物校验
  *   --dry-run                      只打印将要执行的步骤
  *   --name-prefix <前缀>            指定产物 ASCII 前缀（默认从包名/appId 推断）
+ *   --allow-cross-build            允许在非 Windows 宿主构建 Windows 包（原生模块会失败）
  *
- * 退出码：0 成功；1 校验失败；2 参数错；3 构建失败
+ * Windows 签名（证书存储 / SimplySign 云签名器 / PFX）：
+ *   --sign-sha1 <指纹>             证书指纹；默认依次取 SIGN_SHA1 / .electron-release.json / package.json
+ *   --sign-subject <子串>          按 Subject 选择证书（多命中时要求改用 --sign-sha1）
+ *   --timestamp-url <URL>          RFC3161 时间戳服务（默认取项目配置，其次 DigiCert）
+ *   --warmup                       构建前预热签名（触发 PIN / 手机确认）
+ *   --skip-sign                    不签名（同时剥离 WIN_CSC_LINK 等凭据变量）
+ *   --allow-unsigned               没有可用证书时继续（未签名产物会被 SmartScreen 拦截）
+ *   --expect-arch x64|arm64|x86    产物架构断言（交给 verify-win-artifact.mjs；NSIS 看载荷）
+ *   --strict                       校验出现 SKIP 也算失败（发布门禁）
+ *
+ * 退出码：0 成功；1 收尾/校验失败；2 参数或环境错误（含签名前置检查不通过）；
+ *         3 构建失败。
  */
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
-const require_ = createRequire(import.meta.url);
+import { loadProjectConfig } from './lib/project-config.mjs';
+import { createCodec, sha512Buffer } from './lib/manifest.mjs';
+import { resolveWindowsSigning, buildSigningArgs, prewarmSigning, stripSigningEnv as stripSigningEnvVars } from './lib/windows-sign.mjs';
+
+const SKILL_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------- 参数 ----------
 const argv = process.argv.slice(2);
@@ -34,10 +52,36 @@ const opt = (name, def = null) => {
   return i >= 0 ? (argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : true) : def;
 };
 const has = (name) => argv.includes(name);
+
+// `--help` 必须最先处理：否则会去读 cwd 的 package.json 并报「未找到 package.json」，
+// 而 SKILL.md / README 都把 `build.mjs --help` 当作「完整选项的唯一真相来源」。
+// 直接复用本文件头部注释，避免再维护第二份选项表。
+if (has('--help') || has('-h')) {
+  const selfText = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  const doc = /^\/\*\*([\s\S]*?)\*\//m.exec(selfText);
+  const body = doc
+    ? doc[1]
+        .split(/\r?\n/)
+        .map((l) => l.replace(/^\s*\* ?/, ''))
+        .join('\n')
+        .trim()
+    : '用法见 scripts/build.mjs 头部注释';
+  console.log(body);
+  process.exit(0);
+}
+
 // 位置参数 = 既不是 `--xxx`、也不是某个选项的取值。
 // ⚠️ 旧实现把「--platform 的取值」也算成位置参数，于是文档里的
 //    `build.mjs --platform win <项目根>` 会把 `win` 当成项目根 → chdir 到 <cwd>/win 失败。
-const VALUE_FLAGS = new Set(['--platform', '--out', '--name-prefix']);
+const VALUE_FLAGS = new Set([
+  '--platform',
+  '--out',
+  '--name-prefix',
+  '--sign-sha1',
+  '--sign-subject',
+  '--timestamp-url',
+  '--expect-arch',
+]);
 const positional = [];
 for (let i = 0; i < argv.length; i += 1) {
   const a = argv[i];
@@ -51,8 +95,19 @@ for (let i = 0; i < argv.length; i += 1) {
 const PLATFORM = opt('--platform', 'mac');
 const ROOT = path.resolve(positional[0] || process.cwd());
 const SKIP_TESTS = has('--skip-tests');
+const SKIP_BUILD = has('--skip-build');
 const NO_FINALIZE = has('--no-finalize');
+const NO_VERIFY = has('--no-verify');
 const DRY = has('--dry-run');
+const WARMUP = has('--warmup');
+const SKIP_SIGN = has('--skip-sign');
+const ALLOW_UNSIGNED = has('--allow-unsigned');
+const ALLOW_CROSS_BUILD = has('--allow-cross-build');
+const SIGN_SHA1 = opt('--sign-sha1');
+const SIGN_SUBJECT = opt('--sign-subject');
+const TIMESTAMP_URL = opt('--timestamp-url');
+const EXPECT_ARCH = opt('--expect-arch');
+const VERIFY_STRICT = has('--strict');
 
 const C = { r: '\x1b[31m', g: '\x1b[32m', y: '\x1b[33m', d: '\x1b[2m', c: '\x1b[36m', x: '\x1b[0m' };
 const log = (s) => console.log(`${C.c}▸${C.x} ${s}`);
@@ -61,21 +116,46 @@ const bad = (s) => console.log(`${C.r}✗${C.x} ${s}`);
 const warn = (s) => console.log(`${C.y}!${C.x} ${s}`);
 const dim = (s) => console.log(`${C.d}  ${s}${C.x}`);
 
+if (!['mac', 'win', 'linux', 'all'].includes(PLATFORM)) {
+  bad(`--platform 只支持 mac|win|linux|all，收到：${PLATFORM}`);
+  process.exit(2);
+}
+if (EXPECT_ARCH === true) {
+  bad('--expect-arch 需要一个值（x64 / arm64 / x86）');
+  process.exit(2);
+}
+if ((has('--sign-sha1') && SIGN_SHA1 === true) || (has('--sign-subject') && SIGN_SUBJECT === true) || (has('--timestamp-url') && TIMESTAMP_URL === true)) {
+  bad('--sign-sha1 / --sign-subject / --timestamp-url 都需要值');
+  process.exit(2);
+}
+// 纯参数矛盾，必须在任何前置检查（签名预检、证书枚举）之前拦下：
+// 否则在没证书的机器上会先报「签名前置检查未通过」，掩盖真正的参数错误。
+if (SKIP_BUILD && NO_FINALIZE) {
+  bad('--skip-build 与 --no-finalize 同时使用没有任何动作');
+  process.exit(2);
+}
+
 const IS_WIN = process.platform === 'win32';
 
 /**
- * 跨平台执行 npm / npx。
+ * 跨平台执行 npm / npx / 自定义命令。
  *
  * Windows 上 npm 实际是 `npm.cmd`：`spawnSync('npm', [...], {shell:false})` 会直接 ENOENT
  * （libuv 只补 `.exe`，不认 PATHEXT）；而 Node ≥18.20 出于 CVE-2024-27980 又禁止
  * 无 shell 执行 `.cmd`。所以 Windows 必须 `shell: true`。
  * 代价：shell 模式下 Node 只是把 args 用空格拼接、不自动加引号，
- * 带空格的参数必须自己包引号（本脚本传入的都是脚本名/flag，无空格）。
+ * 带空格的参数必须自己包引号（签名参数里的 Subject 可能含空格/中文）。
  */
+function quoteShellArg(a) {
+  const s = String(a);
+  if (!/[\s"&|<>^]/.test(s)) return s;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
 function runTool(cmd, args, opts = {}) {
   if (IS_WIN) {
     const bin = cmd === 'npm' ? 'npm.cmd' : cmd === 'npx' ? 'npx.cmd' : cmd;
-    return spawnSync(bin, args, { shell: true, windowsHide: true, ...opts });
+    return spawnSync(bin, args.map(quoteShellArg), { shell: true, windowsHide: true, ...opts });
   }
   return spawnSync(cmd, args, opts);
 }
@@ -91,7 +171,7 @@ if (!fs.existsSync(pkgPath)) {
 }
 let pkg;
 try {
-  pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8').replace(/^\uFEFF/, ''));
 } catch (e) {
   bad(`package.json 解析失败：${e.message}`);
   process.exit(2);
@@ -109,59 +189,26 @@ if (!hasElectron && !hasTool) {
 }
 
 const build = pkg.build || {};
-const OUTPUT_DIR = opt('--out') || build.directories?.output || 'dist';
+const projectConfig = loadProjectConfig(ROOT);
+if (projectConfig.error) {
+  warn(`${projectConfig.path} 解析失败（${projectConfig.error}），已忽略项目级配置`);
+}
+const cfgBuild = (projectConfig.config && projectConfig.config.build) || {};
+// ⚠️ 历史缺陷：旧实现把 `--out` 同时当作 builder 输出目录与收尾目录，
+//    于是传了 `--out` 就命中「--out 不能等于产物目录本身」的自毁守卫，选项必然失败。
+//    现在 `--out` 只覆盖收尾目录，builder 输出目录只看项目配置。
+const OUTPUT_DIR = cfgBuild.outputDir || build.directories?.output || 'dist';
 const VERSION = pkg.version;
 const PRODUCT = build.productName || pkg.name || 'app';
 
-// ---------- YAML 解析（优先项目依赖，退化到内置最小实现） ----------
-let yaml = null;
-for (const base of [ROOT, process.cwd()]) {
-  try { yaml = createRequire(path.join(base, 'noop.js'))('js-yaml'); break; } catch { /* 继续尝试 */ }
-}
-
-/** 极简 YAML 读取：仅支持本脚本需要的 files[]/version/path/sha512 结构 */
-function miniYaml(text) {
-  const out = { files: [] };
-  let cur = null;
-  for (const raw of text.split('\n')) {
-    if (!raw.trim() || raw.trim().startsWith('#')) continue;
-    const vm = /^version:\s*(.+)$/.exec(raw);
-    if (vm && !raw.startsWith(' ')) { out.version = vm[1].trim().replace(/^["']|["']$/g, ''); continue; }
-    const pm = /^path:\s*(.+)$/.exec(raw);
-    if (pm && !raw.startsWith(' ')) { out.path = pm[1].trim().replace(/^["']|["']$/g, ''); continue; }
-    const sm = /^sha512:\s*(.+)$/.exec(raw);
-    if (sm && !raw.startsWith(' ')) { out.sha512 = sm[1].trim().replace(/^["']|["']$/g, ''); continue; }
-    const um = /^\s*-\s*url:\s*(.+)$/.exec(raw);
-    if (um) { cur = { url: um[1].trim().replace(/^["']|["']$/g, '') }; out.files.push(cur); continue; }
-    const fm = /^\s+(sha512|size):\s*(.+)$/.exec(raw);
-    if (fm && cur) { cur[fm[1]] = fm[2].trim().replace(/^["']|["']$/g, ''); continue; }
-  }
-  return out;
-}
-
-function parseYaml(text) {
-  if (yaml) {
-    try { return yaml.load(text); } catch { /* 落到mini */ }
-  }
-  return miniYaml(text);
-}
-
-function dumpYaml(obj) {
-  if (yaml) {
-    try { return yaml.dump(obj, { lineWidth: -1, noRefs: true }); } catch { /* 落到 mini */ }
-  }
-  // 内置序列化：files 展开为多行，保证 sha512/size 独立成行（这是硬要求）
-  const L = [`version: ${obj.version}`];
-  L.push('files:');
-  for (const f of obj.files) {
-    L.push(`  - url: ${f.url}`);
-    L.push(`    sha512: ${f.sha512}`);
-    L.push(`    size: ${f.size}`);
-  }
-  if (obj.path) L.push(`path: ${obj.path}`);
-  if (obj.sha512) L.push(`sha512: ${obj.sha512}`);
-  if (obj.releaseDate) L.push(`releaseDate: '${obj.releaseDate}'`);
-  return L.join('\n') + '\n';
+// ---------- 清单解析（统一实现在 lib/manifest.mjs） ----------
+// 有项目 js-yaml 就用它（保真、保留未知字段），没有则用内置最小解析器，
+// 保证「零第三方依赖也能跑完整收尾」。
+const manifestCodec = createCodec([ROOT, process.cwd()]);
+const parseYaml = manifestCodec.parse;
+const dumpYaml = manifestCodec.dump;
+if (!manifestCodec.usingLibrary) {
+  dim('未找到 js-yaml，清单解析使用内置解析器（仅支持 electron-updater 固定形态）');
 }
 
 // ---------- 文件名映射（中文名 → ASCII 名） ----------
@@ -204,28 +251,73 @@ function asciiName(name) {
 // ---------- 步骤1：选构建命令 ----------
 /**
  * 选构建命令。优先级：
- *   1. 项目专用的打包脚本（package / release:dry 之类）——它自带收尾（ASCII 改名 + 清单生成）
- *   2. 平台 build 脚本（build:mac / build:win）—— 只构建，**不收尾**，由本脚本补
- *   3. 裸 electron-builder —— 同样只构建
+ *   0. `.electron-release.json#build.command`（项目显式指定）
+ *   1. **平台专属脚本**（dist:win / package:win / build:win / dist:mac:arm64 …）
+ *      —— 必须先于通用脚本，否则会把 mac 专用链路跑到 Windows 上
+ *   2. 通用打包脚本（package / dist / pack）—— 可能自带收尾，也可能含平台专属步骤
+ *   3. build 编译脚本 / 裸 electron-builder —— 只构建，收尾由本脚本补齐
  *
- * 注意：`build:mac` 虽然存在，但它不产ASCII 名与配对清单，
- * 所以即便用了它，也必须由本脚本走 finalize 补齐收尾。
+ * 注意：除了项目自己的 package 脚本，其他命令都不产 ASCII 名与配对清单，
+ * 所以无论选了哪条，都必须走本脚本的 finalize 收尾。
  */
 function pickBuildCommand() {
   const scripts = pkg.scripts || {};
-  // 1. 优先「只打包不发布」的专用脚本
-  for (const name of ['package', 'dist', 'pack']) {
-    if (typeof scripts[name] === 'string' && scripts[name].trim()) {
-      return { cmd: 'npm', args: ['run', name], via: `npm run ${name}`, isPackageScript: true };
+  const hasScript = (n) => typeof scripts[n] === 'string' && scripts[n].trim();
+
+  // 0. 项目级配置显式指定（模板 assets/project-config.template.json#build.command）
+  if (typeof cfgBuild.command === 'string' && cfgBuild.command.trim()) {
+    return {
+      cmd: 'custom',
+      shellCommand: cfgBuild.command.trim(),
+      via: cfgBuild.command.trim(),
+      origin: 'config',
+    };
+  }
+
+  // 1. 平台专属脚本：dist:win / package:win / build:win …，也支持 dist:win:x64 变体
+  if (PLATFORM !== 'all') {
+    const candidates = [];
+    for (const base of ['dist', 'package', 'build', 'pack', 'release']) {
+      candidates.push(`${base}:${PLATFORM}`);
+      const prefix = `${base}:${PLATFORM}:`;
+      for (const key of Object.keys(scripts)) {
+        if (key.startsWith(prefix) && hasScript(key)) candidates.push(key);
+      }
+    }
+    for (const name of candidates) {
+      if (hasScript(name)) {
+        return { cmd: 'npm', args: ['run', name], via: `npm run ${name}`, origin: 'platform' };
+      }
     }
   }
-  // 2. 平台脚本
-  const key = PLATFORM === 'win' ? 'build:win' : PLATFORM === 'linux' ? 'build:linux' : 'build:mac';
-  if (typeof scripts[key] === 'string') return { cmd: 'npm', args: ['run', key], via: `npm run ${key}` };
-  if (typeof scripts.build === 'string') return { cmd: 'npm', args: ['run', 'build'], via: 'npm run build' };
-  // 3. 裸命令
+
+  // 2. 通用打包脚本
+  for (const name of ['package', 'dist', 'pack']) {
+    if (hasScript(name)) {
+      return {
+        cmd: 'npm',
+        args: ['run', name],
+        via: `npm run ${name}`,
+        origin: 'generic',
+        platformHint:
+          PLATFORM === 'win' && /(screenshot:mac|native:[^\s]*mac|--mac\b)/i.test(scripts[name])
+            ? `脚本内容含 mac 专属步骤：${scripts[name]}`
+            : null,
+      };
+    }
+  }
+
+  // 3. 编译脚本 / 裸 builder
+  if (hasScript('build')) {
+    return { cmd: 'npm', args: ['run', 'build'], via: 'npm run build', origin: 'compile' };
+  }
   const flags = PLATFORM === 'all' ? [] : ['--' + PLATFORM];
-  return { cmd: 'npx', args: ['electron-builder', ...flags], via: `npx electron-builder ${flags.join(' ')}`.trim() };
+  return {
+    cmd: 'npx',
+    args: ['electron-builder', ...flags],
+    via: `npx electron-builder ${flags.join(' ')}`.trim(),
+    origin: 'npx',
+  };
 }
 
 // ---------- 步骤2：跑测试 ----------
@@ -253,20 +345,45 @@ function runTests() {
  * WorkBuddy 沙箱的 shim（NODE_OPTIONS=--require .../node-language-shim.cjs）会打断
  * asar 写入，**必须剥掉**。兜底路径（node cli.js / --prepackaged 续跑）也必须走这里，
  * 否则一旦走兜底就会带着 shim 再跑一遍，主路径刻意剥离的意义归零。
+ *
+ * stripSigning：`--skip-sign` / 明确的未签名项目要剥掉 WIN_CSC_LINK 等凭据变量，
+ * 否则 electron-builder 会绕过本脚本的意图直接签名。
  */
+let envNoticeShown = false;
+let STRIP_SIGNING_ENV = false;
 function buildEnv() {
-  const env = { ...process.env };
+  let env = { ...process.env };
   if (env.NODE_OPTIONS) {
     delete env.NODE_OPTIONS;
-    dim('已剥离 NODE_OPTIONS（沙箱 shim 会打断 asar 写入）');
+    if (!envNoticeShown) {
+      dim('已剥离 NODE_OPTIONS（沙箱 shim 会打断 asar 写入）');
+      envNoticeShown = true;
+    }
   }
+  if (STRIP_SIGNING_ENV) env = stripSigningEnvVars(env);
   return env;
 }
 
 /** 执行构建命令，返回 { ok, out, via } */
-function doBuild(plan) {
+function doBuild(plan, extraBuilderArgs = []) {
   log(`构建：${plan.via}`);
-  const r = runTool(plan.cmd, plan.args, { encoding: 'utf8', env: buildEnv() });
+  if (plan.origin === 'custom') {
+    warn('使用了 .electron-release.json#build.command：签名参数只能追加在命令末尾，需确认最后一步是 electron-builder');
+  }
+  let r;
+  if (plan.cmd === 'custom') {
+    const cmdline = [plan.shellCommand, ...extraBuilderArgs.map(quoteShellArg)].join(' ');
+    if (extraBuilderArgs.length) dim(`  追加签名参数：${extraBuilderArgs.join(' ')}`);
+    r = spawnSync(cmdline, { shell: true, windowsHide: true, encoding: 'utf8', env: buildEnv() });
+  } else {
+    const args = [...plan.args];
+    if (extraBuilderArgs.length) {
+      if (plan.cmd === 'npm') args.push('--');
+      args.push(...extraBuilderArgs);
+      dim(`  追加签名参数：${extraBuilderArgs.join(' ')}`);
+    }
+    r = runTool(plan.cmd, args, { encoding: 'utf8', env: buildEnv() });
+  }
   // spawn 自身失败（ENOENT / EACCES）时 stdout/stderr 都是空的，必须把 r.error 带上，
   // 否则报错信息为空、兜底判定也无从命中（表现为「构建失败 + 一片空白」）。
   const out = ((r.stdout || '') + (r.stderr || '') + (r.error ? `\n${r.error.code || 'SPAWN_ERROR'} ${r.error.message}` : '')).trim();
@@ -323,7 +440,7 @@ function shouldFallbackToCli(res) {
   return SHIM_FAILURE.test(res.out || '') || missingScriptIsRequest(res);
 }
 
-function buildWithNodeCli(summary) {
+function buildWithNodeCli(summary, extraBuilderArgs = []) {
   const cli = localBuilderCli();
   if (!cli) {
     bad('项目内找不到 node_modules/electron-builder/cli.js，无法回退');
@@ -331,7 +448,8 @@ function buildWithNodeCli(summary) {
   }
   warn(`npm 脚本不可用（${summary}），回退到 node cli.js`);
   const flags = PLATFORM === 'all' ? [] : [`--${PLATFORM}`];
-  const args = [cli, ...flags, '--publish', 'never'];
+  const args = [cli, ...flags, '--publish', 'never', ...extraBuilderArgs];
+  if (extraBuilderArgs.length) dim(`  追加签名参数：${extraBuilderArgs.join(' ')}`);
   const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, env: buildEnv() });
   const out = ((r.stdout || '') + (r.stderr || '')).trim();
   return { ok: r.status === 0, out, via: `node cli.js ${args.slice(1).join(' ')}` };
@@ -420,7 +538,7 @@ function patchExeMetadata(cmd) {
   return false;
 }
 
-function recoverFromRceditLock(out) {
+function recoverFromRceditLock(out, extraBuilderArgs = []) {
   const cmd = extractRceditCommand(out);
   if (!cmd) {
     bad('未从日志中解析出 rcedit 命令行');
@@ -447,7 +565,9 @@ function recoverFromRceditLock(out) {
     return false;
   }
   log(`续跑分发目标：--prepackaged ${appOutDir}`);
-  const args = [cli, '--win', '--publish', 'never', '--prepackaged', appOutDir];
+  // 续跑仍会执行签名（nsis 安装包在这一步才签），必须带上同样的签名参数
+  const args = [cli, '--win', '--publish', 'never', '--prepackaged', appOutDir, ...extraBuilderArgs];
+  if (extraBuilderArgs.length) dim(`  追加签名参数：${extraBuilderArgs.join(' ')}`);
   const r = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true, env: buildEnv() });
   const o = ((r.stdout || '') + (r.stderr || '')).trim();
   if (r.status !== 0) {
@@ -565,7 +685,7 @@ function finalize(outDir) {
       continue;
     }
     if (f.sha512) {
-      const h = crypto.createHash('sha512').update(buf).digest('base64');
+      const h = sha512Buffer(buf);
       if (h !== f.sha512) { bad(`${name} sha512 与清单不一致`); fail = 1; continue; }
     }
     ok(`${name}  ${Math.round(buf.length / 1048576)}MB`);
@@ -591,17 +711,123 @@ function checkBatch(outDir) {
 
 const BUILD_START = new Date();
 
+// ---------- 产物校验（Windows） ----------
+/**
+ * 收尾后跑 verify-win-artifact.mjs 做产物级断言。
+ *
+ * 这是 §0 铁律 4 的落地：构建成功 ≠ 可分发。签名被跳过、签名晚于 sha512、
+ * 旧批次混入、PE 架构不符，都不会让构建失败，只会在客户端暴露。
+ * 校验脚本用 --json 输出，本函数负责渲染与汇总；退出码非 0 直接判失败。
+ */
+function runWinVerify(dir) {
+  const script = path.join(SKILL_DIR, 'verify-win-artifact.mjs');
+  if (!fs.existsSync(script)) return { skipped: true, reason: `找不到校验脚本：${script}` };
+  const jsonOut = path.join(os.tmpdir(), `electron-release-verify-${process.pid}-${Date.now()}.json`);
+  const args = [
+    script,
+    '--dir',
+    dir,
+    '--manifest',
+    'latest.yml',
+    '--expect-version',
+    String(VERSION),
+    '--json-out',
+    jsonOut,
+  ];
+  if (EXPECT_ARCH) args.push('--expect-arch', String(EXPECT_ARCH));
+  // 明确不签名的项目（--skip-sign / 项目配置 method=none / --allow-unsigned）里，
+  // 未签名是预期结果，校验应记 SKIP 而不是 FAIL
+  if (ALLOW_UNSIGNED || signing.mode === 'unsigned') args.push('--allow-unsigned');
+  if (VERIFY_STRICT) args.push('--strict');
+  // stdio: 'ignore' + --json-out：受限沙箱禁止管道捕获，用文件取回结果
+  const r = spawnSync(process.execPath, args, { stdio: 'ignore', windowsHide: true });
+  let out = '';
+  try {
+    if (fs.existsSync(jsonOut)) out = fs.readFileSync(jsonOut, 'utf8');
+  } finally {
+    try {
+      fs.unlinkSync(jsonOut);
+    } catch {
+      /* 清理失败不影响结果 */
+    }
+  }
+  if (!out) {
+    return {
+      skipped: false,
+      exitCode: 2,
+      data: null,
+      out: `校验脚本没有产出结果（退出码 ${r.status}${r.error ? `，${r.error.code || r.error.message}` : ''}）`,
+    };
+  }
+  let data = null;
+  try {
+    data = JSON.parse(out);
+  } catch {
+    data = null;
+  }
+  return {
+    skipped: false,
+    exitCode: typeof r.status === 'number' ? r.status : data?.exitCode ?? 2,
+    data,
+    out,
+  };
+}
+
+function renderWinVerify(result) {
+  if (!result.data) {
+    bad('校验脚本输出无法解析，原始输出：');
+    console.log((result.out || '').split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
+    return;
+  }
+  for (const item of result.data.results) {
+    const icon = item.status === 'PASS' ? '✓' : item.status === 'FAIL' ? '✗' : '!';
+    const color = item.status === 'PASS' ? C.g : item.status === 'FAIL' ? C.r : C.y;
+    console.log(`  ${color}${icon}${C.x} ${item.name}${item.detail ? `  — ${item.detail}` : ''}`);
+  }
+  const failed = result.data.failed || 0;
+  const skipped = result.data.skipped || 0;
+  if (result.exitCode === 0) {
+    ok(`产物校验通过（${result.data.results.length - skipped} 项，SKIP ${skipped} 项）`);
+  } else if (result.exitCode === 3) {
+    bad(`产物校验未通过：--strict 下存在 ${skipped} 项 SKIP（发布门禁）`);
+  } else {
+    bad(`产物校验未通过（FAIL ${failed} 项，SKIP ${skipped} 项，退出码 ${result.exitCode}）`);
+  }
+}
+
+/** 从校验结果里提炼一行签名结论（无法确认时明确写「未确认」） */
+function signatureSummary(data) {
+  const auth = data?.results?.find((r) => /^Authenticode/.test(r.name));
+  const ts = data?.results?.find((r) => /^时间戳/.test(r.name));
+  if (!auth) return '未确认';
+  if (auth.status === 'PASS') {
+    return `已签名（${auth.detail}）${ts?.status === 'PASS' ? '，含时间戳' : ts?.status === 'FAIL' ? '，缺时间戳' : ''}`;
+  }
+  if (auth.status === 'SKIP') return '未签名（已明确接受，用户会看到 SmartScreen）';
+  return `签名无效（${auth.detail}）`;
+}
+
 // ---------- 主流程 ----------
 console.log(`${C.c}══ Electron 构建（自包含，不依赖项目脚本）══${C.x}`);
 log(`项目：${ROOT}`);
 log(`分支：${(spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).stdout || '').trim() || '(非 git 仓库)'}`);
 log(`版本：${VERSION}   平台：${PLATFORM}   输出：${OUTPUT_DIR}/`);
+if (projectConfig.present && projectConfig.config) dim(`项目配置：${projectConfig.path}`);
 
 const plan = pickBuildCommand();
-const usingProjectScript = plan.via.startsWith('npm run');
-if (plan.isPackageScript) ok(`使用项目打包脚本：${plan.via}（自带收尾，本脚本仍会校验）`);
-else if (usingProjectScript) warn(`项目无 package 类脚本，只有 ${plan.via} —— 它不做收尾，本脚本将补齐改名与清单`);
-else warn(`项目无可用打包脚本，回退到：${plan.via} —— 本脚本将补齐收尾`);
+if (plan.origin === 'platform') ok(`使用平台脚本：${plan.via}`);
+else if (plan.origin === 'generic') ok(`使用通用打包脚本：${plan.via}`);
+else if (plan.origin === 'config') ok(`使用项目配置指定的命令：${plan.via}`);
+else if (plan.origin === 'compile') {
+  warn(`只有编译脚本 ${plan.via}：它不产出安装包与更新清单，收尾很可能失败`);
+} else warn(`项目无可用打包脚本，回退到：${plan.via}（本脚本会补齐收尾）`);
+if (plan.platformHint) warn(plan.platformHint);
+// 项目脚本里若显式写了 --publish always/onTag，构建就会触发远端写操作（不可逆）。
+// 本脚本不擅自改动项目命令，但必须让人看到这一步。
+const publishMode = /--publish\s+(\S+)/.exec(String(plan.shellCommand || (pkg.scripts || {})[plan.args?.[1]] || ''));
+if (publishMode && !/^(never|false)$/i.test(publishMode[1])) {
+  warn(`项目脚本包含 ${publishMode[0]}：构建会触发远端发布（不可逆），请确认版本与目标仓库后再继续`);
+}
 
 const outDir = opt('--out') || path.join(OUTPUT_DIR, 'package');
 
@@ -613,9 +839,83 @@ if (!DRY && !NO_FINALIZE && path.resolve(outDir) === path.resolve(OUTPUT_DIR)) {
   process.exit(2);
 }
 
+// ---- Windows 宿主与签名前置（必须早于构建）----
+if (PLATFORM === 'win' && !IS_WIN && !ALLOW_CROSS_BUILD) {
+  bad('Windows 打包必须在 Windows 宿主执行：原生模块无法交叉编译，node-gyp 也拒绝跨平台构建');
+  dim('只出纯 JS 包且已装 Wine 时可加 --allow-cross-build 尝试，但不属于官方支持路径');
+  process.exit(2);
+}
+
+let signing = { mode: 'n/a', certs: [], hints: [] };
+if (PLATFORM === 'win') {
+  signing = resolveWindowsSigning({
+    projectRoot: ROOT,
+    packageBuild: build,
+    projectConfig: projectConfig.config,
+    sha1: SIGN_SHA1,
+    subject: SIGN_SUBJECT,
+    timestampUrl: TIMESTAMP_URL,
+    allowUnsigned: ALLOW_UNSIGNED,
+    skipSign: SKIP_SIGN,
+  });
+  if (signing.mode === 'cert') {
+    ok(`签名：${signing.cert.Subject}`);
+    dim(`thumbprint   ${signing.cert.Thumbprint}`);
+    dim(`来源         ${signing.source}`);
+    dim(`时间戳       ${signing.timestampUrl}`);
+  } else if (signing.mode === 'pfx' || signing.mode === 'pfx-env') {
+    ok(`签名：PFX（${signing.source}）${signing.reason ? '  ' + signing.reason : ''}`);
+  } else if (signing.mode === 'unsigned') {
+    warn(`不签名：${signing.reason || signing.source}`);
+    STRIP_SIGNING_ENV = true;
+    const pkgSig = (build.win && build.win.signtoolOptions) || build.win || {};
+    const configured = pkgSig.certificateSha1 || pkgSig.certificateSubjectName || pkgSig.certificateFile;
+    if (configured) {
+      warn('项目构建配置里已声明签名证书：--skip-sign / method=none 不会覆盖 electron-builder 的配置，产物仍会被签名');
+      dim('  若要真正不签名，需从 package.json#build.win.signtoolOptions 移除证书字段');
+    }
+  } else if (signing.mode === 'choose') {
+    if (DRY) {
+      warn(`dry-run 预检：${signing.error || '存在多张可用证书'}`);
+      for (const hint of signing.hints) dim(`  ${hint}`);
+    } else {
+      bad(signing.error || '存在多张可用证书');
+      for (const hint of signing.hints) dim(`  ${hint}`);
+      process.exit(2);
+    }
+  } else {
+    if (DRY) {
+      warn(`dry-run 预检：${signing.error || signing.reason || signing.mode}`);
+      for (const hint of signing.hints || []) dim(`  ${hint}`);
+    } else {
+      bad(`签名前置检查未通过：${signing.error || signing.reason || signing.mode}`);
+      for (const hint of signing.hints || []) {
+        for (const line of String(hint).split('\n')) dim(`  · ${line.trim()}`);
+      }
+      dim('可先单独运行：node <SKILL_DIR>/scripts/preflight-win-sign.mjs <项目> --warmup');
+      process.exit(2);
+    }
+  }
+}
+const signingArgs = buildSigningArgs(signing);
+if (signingArgs.length) dim(`electron-builder 签名参数：${signingArgs.join(' ')}`);
+
 if (DRY) {
+  dim(`收尾目录     ${outDir}/`);
+  if (WARMUP && signing.mode === 'cert') dim('dry-run：不执行预热签名');
   dim('dry-run：以上为将要执行的步骤，未实际运行');
   process.exit(0);
+}
+
+// 预热签名：把 PIN / 手机确认从「构建卡住」前移到构建之前
+if (WARMUP && signing.mode === 'cert') {
+  log('预热签名（触发 PIN / 手机确认）');
+  const warmed = prewarmSigning({ signing, projectRoot: ROOT, outputDir: OUTPUT_DIR });
+  if (!warmed.ok) {
+    bad(`预热失败：${warmed.reason}`);
+    process.exit(2);
+  }
+  ok(`预热成功：${warmed.signtool}`);
 }
 
 // 构建前提示旧产物批次
@@ -624,27 +924,31 @@ if (!NO_FINALIZE && fs.existsSync(outDir)) {
   if (!b.ok) warn(`${outDir}/ 存在旧产物（${b.reason}）—— 构建不可复现，收尾时会重建`);
 }
 
-if (!runTests()) process.exit(1);
+if (!SKIP_BUILD) {
+  if (!runTests()) process.exit(1);
 
-let buildRes = doBuild(plan);
+  let buildRes = doBuild(plan, signingArgs);
 
-// 兜底 1：npm 脚本 / .bin shim 不可用（跨平台拷贝来的 node_modules 常见）
-if (!buildRes.ok && shouldFallbackToCli(buildRes)) {
-  const alt = buildWithNodeCli(buildRes.via);
-  if (alt) buildRes = alt;
-}
+  // 兜底 1：npm 脚本 / .bin shim 不可用（跨平台拷贝来的 node_modules 常见）
+  if (!buildRes.ok && shouldFallbackToCli(buildRes)) {
+    const alt = buildWithNodeCli(buildRes.via, signingArgs);
+    if (alt) buildRes = alt;
+  }
 
-// 兜底 2：rcedit 被实时防护瞬时锁定（Windows 必现，等 8~30s 即恢复）
-if (!buildRes.ok && PLATFORM === 'win' && /Unable to commit changes/i.test(buildRes.out)) {
-  bad('rcedit 被实时防护短暂锁定，进入退避补写');
-  if (!recoverFromRceditLock(buildRes.out)) process.exit(3);
-  buildRes = { ok: true, out: '', via: 'prepackaged 续跑' };
-}
+  // 兜底 2：rcedit 被实时防护瞬时锁定（Windows 必现，等 8~30s 即恢复）
+  if (!buildRes.ok && PLATFORM === 'win' && /Unable to commit changes/i.test(buildRes.out)) {
+    bad('rcedit 被实时防护短暂锁定，进入退避补写');
+    if (!recoverFromRceditLock(buildRes.out, signingArgs)) process.exit(3);
+    buildRes = { ok: true, out: '', via: 'prepackaged 续跑' };
+  }
 
-if (!buildRes.ok) {
-  bad(`构建失败（${buildRes.via}），末尾输出：`);
-  console.log(buildRes.out.split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
-  process.exit(3);
+  if (!buildRes.ok) {
+    bad(`构建失败（${buildRes.via}），末尾输出：`);
+    console.log(buildRes.out.split('\n').slice(-20).map((l) => '    ' + l).join('\n'));
+    process.exit(3);
+  }
+} else {
+  warn('--skip-build：跳过测试与构建，直接对现有产物做收尾与校验');
 }
 
 if (NO_FINALIZE) {
@@ -660,18 +964,44 @@ if (!okFinal) {
   process.exit(1);
 }
 
-const b = checkBatch(outDir);
-if (b.ok) ok('批次核对：收尾产物与本次构建同批次');
-else warn(`批次核对异常：${b.reason}`);
+if (!SKIP_BUILD) {
+  const b = checkBatch(outDir);
+  if (b.ok) ok('批次核对：收尾产物与本次构建同批次');
+  else warn(`批次核对异常：${b.reason}`);
+}
+
+let verifyResult = null;
+if (PLATFORM === 'win' && !NO_VERIFY) {
+  log('产物校验：清单 / sha512 / PE 架构 / blockmap / Authenticode');
+  verifyResult = runWinVerify(outDir);
+  if (verifyResult.skipped) {
+    warn(verifyResult.reason);
+  } else {
+    renderWinVerify(verifyResult);
+    if (verifyResult.exitCode !== 0) {
+      bad('产物校验未通过，产物不得分发');
+      process.exit(1);
+    }
+  }
+}
 
 console.log('');
 log(`完成 v${VERSION}（未提交、未上传）`);
 dim(`可分发目录   ${outDir}/`);
 dim(`原始产物     ${OUTPUT_DIR}/`);
 dim(`清单         ${path.join(outDir, path.basename(manifestPathFor(PLATFORM === 'all' ? 'mac' : PLATFORM)))}`);
+if (verifyResult?.data) dim(`签名         ${signatureSummary(verifyResult.data)}`);
 console.log('');
 warn('以下需人工完成：');
-dim('  · 签名/公证：本项目 identity: null，产物未签名，Gatekeeper 会拦截');
+if (PLATFORM === 'win') {
+  if (signing.mode === 'cert') {
+    dim('  · 签名已完成；若客户端更新校验失败，核对 publisherName 与证书 Subject 是否完全一致');
+  } else {
+    dim('  · 产物未签名：首次安装与每次升级都会被 SmartScreen 拦截（不是 bug）');
+  }
+} else {
+  dim('  · 签名/公证：按 references/mechanism.md 手工核对，本脚本不代签');
+}
 dim('  · 版本号：若 tag 已存在，必须先递增版本号（客户端按 semver 判断是否升级）');
 dim('  · 发布：推 tag → 建 Release → 改写清单为绝对地址 → 部署到更新源');
 process.exit(0);
