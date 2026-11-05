@@ -28,11 +28,15 @@ Electron 打包看着是`npx electron-builder` 一条命令，实际有三个反
 electron-release/
 ├── SKILL.md                    # 技能定义，YAML frontmatter 含 name 与 description
 ├── README.md
+├── LICENSE
 ├── scripts/                    # probe.sh / probe.mjs / verify-artifact.sh
-│                               # verify-win-artifact.mjs / build.mjs / install.sh
+│                               # verify-win-artifact.mjs / manifest-cli.mjs / build.mjs / install.sh
+│   └── lib/                    # 共用模块：manifest（清单解析）/ windows-sign / powershell / project-config
 ├── references/
 │   ├── mechanism.md            # mac 为主：公证、凭据、清单结构、坑位
 │   └── windows.md              # Windows 分册：NSIS、签名时序、云签名器、故障树
+├── tests/
+│   └── smoke.mjs               # 可复跑自测（合成夹具，10 项契约断言）
 └── assets/
     └── project-config.template.json
 ```
@@ -43,7 +47,7 @@ mkdir -p ~/.agents/skills && unzip electron-release-skill.zip -d ~/.agents/skill
 
 # 2. 链接到已装的 agent
 bash ~/.agents/skills/electron-release/scripts/install.sh --list   # 先看支持项
-bash ~/.agents/skills/electron-release/scripts/install.sh# 自动探测并链接
+bash ~/.agents/skills/electron-release/scripts/install.sh   # 自动探测并链接
 ```
 
 支持的位置（`--list` 会显示本机哪些存在）：
@@ -57,6 +61,7 @@ bash ~/.agents/skills/electron-release/scripts/install.sh# 自动探测并链接
 | `windsurf` | `~/.codeium/windsurf/skills/` | Windsurf |
 | `gemini` | `~/.gemini/skills/` | Gemini CLI |
 | `copilot` | `~/.config/github-copilot/skills/` | GitHub Copilot CLI |
+| `workbuddy` | `~/.workbuddy/skills/` | WorkBuddy |
 
 其他参数：`--copy` 用复制代替软链（跨机/ Windows / 不支持符号链接的环境）、
 `--all` 装到全部位置、`--link <id...>` 只装指定几个。
@@ -68,6 +73,7 @@ bash ~/.agents/skills/electron-release/scripts/install.sh# 自动探测并链接
 ```
 <repo>/.agents/skills/electron-release/     # 跨 agent
 <repo>/.claude/skills/electron-release/     # Claude Code 专用
+<repo>/.workbuddy/skills/electron-release/  # WorkBuddy 专用
 ```
 
 提交前确认配置类文件（`.electron-release.json`）不含凭据。
@@ -119,7 +125,7 @@ bash $S/scripts/verify-artifact.sh --feed https://example.com/updates/ 1.2.3
 
 ```bash
 # 推荐：自动选命令 + 自动收尾 + 自动校验 + 批次核对
-node ~/.agents/skills/electron-release/scripts/build.mjs[选项] [项目根目录]
+node ~/.agents/skills/electron-release/scripts/build.mjs [选项] [项目根目录]
 
 # 只看会执行什么，不实际构建
 node ~/.agents/skills/electron-release/scripts/build.mjs --dry-run .
@@ -128,11 +134,21 @@ node ~/.agents/skills/electron-release/scripts/build.mjs --dry-run .
 | 选项 | 说明 |
 |---|---|
 | `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）；选项与位置参数顺序无关。**两平台请分开跑**，`all` 的收尾只读 `latest-mac.yml`，且共用 `package/` 会互相覆盖 |
-| `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`） |
+| `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`，不再影响 builder 输出目录） |
 | `--name-prefix <前缀>` | 指定产物 ASCII 前缀（默认从包名/appId 推断） |
 | `--skip-tests` | 跳过单元测试 |
+| `--skip-build` | 跳过测试与构建，只重跑收尾 + 校验 |
 | `--no-finalize` | 只构建，不收尾不校验 |
+| `--no-verify` | 收尾后不跑 `verify-win-artifact.mjs` |
 | `--dry-run` | 只打印将执行的步骤 |
+| `--sign-sha1 <40位>` | Windows 证书指纹；默认依次取 `SIGN_SHA1` / `.electron-release.json` / `package.json` |
+| `--sign-subject <子串>` | 按 Subject 选择 Windows 证书 |
+| `--timestamp-url <URL>` | RFC3161 时间戳服务 |
+| `--warmup` | 构建前预热签名（SimplySign 的 PIN/手机确认） |
+| `--skip-sign` | 不签名（同时剥离 `WIN_CSC_LINK` 等凭据变量） |
+| `--allow-unsigned` | 没有可用证书时继续（未签名产物会触发 SmartScreen） |
+| `--expect-arch x64\|arm64` | 产物架构断言（NSIS 包自动校验载荷） |
+| `--strict` | 校验出现 SKIP 也算失败（发布门禁） |
 
 **它解决四个高频问题**：
 
@@ -147,6 +163,31 @@ node ~/.agents/skills/electron-release/scripts/build.mjs --dry-run .
 
 > ⚠️ 换了构建命令**不等于**可以跳过收尾。`build:mac` 与裸 `electron-builder` 都不会
 > 产 ASCII 名与配对清单，直接投放会导致客户端 sha512 校验失败。
+
+## Windows 签名（SimplySign / 证书存储）
+
+把项目脚本里硬编码的证书指纹通用化成了「预检 + 自动注入」两步，**不需要改项目代码**：
+
+```bash
+S=~/.agents/skills/electron-release
+
+# ① 首次 / 换机：确认登录态、证书可见、PIN 已预热（会弹 PIN/手机确认）
+node $S/scripts/preflight-win-sign.mjs <项目> --warmup
+
+# ② 打包：自动解析证书 → 注入 signtoolOptions → 构建 → 收尾 → 产物校验
+node $S/scripts/build.mjs --platform win --expect-arch x64 <项目>
+```
+
+证书来源优先级：`--sign-sha1` / `--sign-subject` → `SIGN_SHA1` → `.electron-release.json`
+→ `package.json#build.win.signtoolOptions` → 证书存储里唯一一张可用证书。
+命中多张会停止并列出候选，不会猜。
+
+**默认安全姿态**：Windows 上找不到可用证书、项目也没声明不签名时，`build.mjs` 在构建前
+以退出码 2 停止，避免产出「能装但没签名」的包。确实不签名请显式 `--allow-unsigned`
+或在项目里写 `signing.windows.method: "none"`。
+
+构建后会自动跑 `verify-win-artifact.mjs`：清单 / sha512 / PE 架构 / blockmap / Authenticode，
+任一 FAIL（或 `--strict` 下的 SKIP）都会让本次构建失败。
 
 Windows 上一次成功构建的真实日志（用于对照是否走到兜底分支）：
 
@@ -205,7 +246,9 @@ $ verify-artifact.sh --manifest dist/latest-mac.yml --dir dist
 ✓ app-1.2.3.dmg  117MB  sha512 匹配
 ```
 
-YAML 依赖自动回退：项目的 `js-yaml` → 系统 `pyyaml` → 明确报错（**不静默跳过**）。
+清单校验走 `scripts/manifest-cli.mjs`：**零第三方依赖**（内置解析器只认 electron-updater
+固定形态）。装了 `js-yaml` 时 `build.mjs` 会自动改用它以保留清单里的未知字段；
+系统 `pyyaml` 只作为没有 Node 时的兜底。两者都没有才明确报错（**不静默跳过**）。
 
 **③ 线上更新源**
 
@@ -220,6 +263,33 @@ $ verify-artifact.sh --feed https://example.com/updates/ 1.2.3
 关键能力：**自动做「走代理 vs `--noproxy` 直连」双路对比**，避免把服务器问题
 误判成代理问题。同时校验线上版本与期望是否一致、检查清单 url 是相对（同目录托管）
 还是绝对地址（分开托管）。
+
+### `preflight-win-sign.mjs` —— Windows 签名前置检查
+
+```bash
+node scripts/preflight-win-sign.mjs <项目> [--sha1 <指纹>] [--warmup] [--allow-unsigned] [--json]
+```
+
+```
+▸ 证书存储：Cert:\CurrentUser\My（代码签名 EKU）
+  候选 · CN=射手科技（珠海）有限公司, O=…  thumbprint=…  HasPrivateKey=True  NotAfter=2027-09-01
+✓ 可用证书：CN=…
+  thumbprint   f37ada…
+  HasPrivateKey True    NotAfter 2027-09-01
+  来源         证书存储（唯一可用证书）
+  时间戳       http://timestamp.digicert.com
+  signtool     …\winCodeSign-2.6.0\windows-10\x64\signtool.exe
+```
+
+| 能力 | 说明 |
+|---|---|
+| 证书枚举 | `Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert`，区分 `HasPrivateKey` 与过期 |
+| 来源判定 | 命令行 / `SIGN_SHA1` / `.electron-release.json` / `package.json` / 存储唯一证书；多命中返回退出码 3 |
+| 登录态提示 | 只读存储；失败时明确提示 SimplySign 是否登录、是否 `0 certs were left` |
+| `--warmup` | 用 builder 缓存里的 64 位 signtool 对**临时副本**签一次，触发 PIN/手机确认后删除，不改项目产物 |
+| `--json` | 供 agent/CI 消费；`--allow-unsigned` 时明确返回「接受不签名」 |
+
+退出码：0 可签 / 已接受不签名；1 不可签；2 参数或环境错误；3 命中多张证书。
 
 ### `verify-win-artifact.mjs` —— Windows 产物断言
 
@@ -272,34 +342,40 @@ node scripts/verify-win-artifact.mjs --dir dist/package --expect-version 1.1.1 \
 | bash | 是 | 无法执行 shell 脚本 |
 | Node.js 16+ | 否 | `probe.sh` 降级为 grep/sed 探测 |
 | macOS 工具链 | 仅签名验证 | 非 macOS 提示改用对应平台命令 |
-| `js-yaml` 或 `pyyaml` | 仅清单校验 | 明确报错，不静默跳过 |
+| `js-yaml` | 否 | 清单校验改用内置零依赖解析器（只认 electron-updater 固定形态） |
+| `pyyaml` | 否 | 仅在没有 Node 时作为 `verify-artifact.sh` 的兜底；两者皆无才报错 |
 | Windows C++ 工具链 | 视原生模块而定 | `node-gyp-build` 类型模块会走源码编译，缺工具链即失败（见 `references/windows.md` §2.3） |
 
 ---
 
 ## 已验证范围
 
+下表的断言已收敛为可复跑脚本：`node tests/smoke.mjs`（合成夹具，10 项，3 秒，不联网）。
+它只证明脚本自身契约没坏，**不替代**真实项目的端到端打包。
+
 | 项 | 验证方式 |
 |---|---|
 | 探测脚本 | 4 类项目实测：electron-builder(package.json)、electron-builder(yml)、Forge、非 Electron |
 | 签名识别 | 真实 dmg 实测，能区分无签名与 ad-hoc |
 | 清单配对 | 真实 `latest-mac.yml` + 真实产物，多产物 sha512 全匹配；错误目录正确报缺失 |
+| 清单解析统一 | `scripts/lib/manifest.mjs` 单一实现：夹具实测「通过 / 篡改产物 / 缺 files / 缺参数」四类输入，退出码 0/1/1/2；`build.mjs --skip-build` 在项目无 `js-yaml` 时走内置解析器仍完成收尾，有 `js-yaml` 时确认走库分支 |
 | 无 Node 降级 | `env -i` 模拟，核心字段仍正确提取 |
 | 完整构建 | 在 idea-note-desktop 实测 `electron-builder --mac`，arm64+x64 共 4 个安装包 + blockmap，36 秒完成 |
 | Windows 产物校验 | 临时产物 + 手工构造 `latest.yml`：正向 9 项 PASS；注入 sha512 篡改、架构不符、blockmap 旧批次三类故障均被拦截；退出码 0/1/2 正确 |
 | Windows 签名探测 | 真实项目实测：正确识别 `publisherName`、RFC3161 时间戳、缺省 `nsis` 块（`oneClick=true`） |
-| Windows 端到端打包 | 真实项目（Electron 33.4.11 + electron-builder 25.1.8，Windows 11 26200 / Node 22）：
-`build.mjs --platform win` 一次跑通「测试 144 用例 → npm shim 回退 → rcedit 锁退避补写 →
-`--prepackaged` 续跑 nsis/zip → ASCII 改名 + blockmap 同名 + latest.yml 配对 → 校验通过」 |
-| Windows 产物校验 | 同一产物上验证：NSIS 载荷架构识别、blockmap 同批、`--allow-unsigned` 降级、
-退出码 0/1 区分（用 `--expect-version` 传错版本确认会 FAIL） |
+| Windows 端到端打包 | 真实项目（Electron 33.4.11 + electron-builder 25.1.8，Windows 11 26200 / Node 22）：`build.mjs --platform win` 一次跑通「测试 144 用例 → npm shim 回退 → rcedit 锁退避补写 → `--prepackaged` 续跑 nsis/zip → ASCII 改名 + blockmap 同名 + latest.yml 配对 → 校验通过」 |
+| Windows 产物校验（降级路径） | 同一产物上验证：NSIS 载荷架构识别、blockmap 同批、`--allow-unsigned` 降级、退出码 0/1 区分（用 `--expect-version` 传错版本确认会 FAIL） |
+| Windows 签名前置/注入 | 合成产物 + 真实 `package.json` 实测：无证书时 `preflight` 退出码 1 并给出登录提示；`build.mjs --platform win` 在构建前停止（退出码 2）；`method:none` / `--skip-sign` / `--allow-unsigned` 正确放行；签名参数按 electron-builder 语法拼装（`--c.win.signtoolOptions.*`），npm 脚本 / `node cli.js` / `--prepackaged` 三条路径都会带 |
+| 收尾 + 校验闭环 | 合成 `latest.yml + NSIS PE + blockmap`：`build.mjs --skip-build` 完成 ASCII 改名 → 清单改写 → sha512 配对 → 自动跑 `verify-win-artifact`（含 SKIP/`--strict` 退出码）；`--out` 自定义目录可用（修复了旧版必然自毁的缺陷） |
+| 受限沙箱 | 在禁止管道捕获的沙箱里，证书枚举与 Authenticode 校验改为临时文件取回结果，可正常执行 |
 
 **未验证**：
 
 - 含**原生模块**的 Windows 打包（需 Windows 宿主 + 真实 ABI 切换脚本）。
 - 真实证书签名的 Authenticode 分支（当前只在未签名产物上验过 `NotSigned` 路径、
   `Get-AuthenticodeSignature` 的 JSON 解析链路）。
-- SimplySign 预热流程（需 Win 打包机 + 真实 PIN 交互）。
+- SimplySign 真实 PIN 交互（代码路径已实现：枚举 → 来源判定 → `--warmup` → 注入参数；
+  但没有可用的云证书，未在真机上完成一次签名）。
 
 skill 中标注为「无法验证时须如实告知」。
 
@@ -322,13 +398,21 @@ skill 中标注为「无法验证时须如实告知」。
 electron-release/
 ├── SKILL.md                    # 主流程（agent 读取的入口）
 ├── README.md                   # 本文件
+├── LICENSE                     # MIT
 ├── scripts/
-│   ├── build.mjs               # 一键构建：选命令 → 收尾 → 校验
+│   ├── build.mjs               # 一键构建：签名预检 → 选命令 → 收尾 → 产物校验
+│   ├── preflight-win-sign.mjs  # Windows 签名前置检查（证书/来源/PIN 预热）
 │   ├── probe.sh                # 探测包装层（无 Node 自动降级）
 │   ├── probe.mjs               # 探测核心（零依赖）
 │   ├── verify-artifact.sh      # macOS：签名 / 公证 / 清单 / 线上源
 │   ├── verify-win-artifact.mjs # Windows：清单 / sha512 / PE / blockmap / Authenticode
-│   └── install.sh              # 多agent 安装器
+│   ├── manifest-cli.mjs       # 清单 ↔ 产物配对校验 CLI（零依赖，供 verify-artifact.sh 调用）
+│   ├── install.sh              # 多agent 安装器
+│   └── lib/
+│       ├── manifest.mjs        # 清单解析/序列化唯一实现（parse / dump / sha512）
+│       ├── windows-sign.mjs    # 证书枚举 / 来源判定 / builder 参数 / 预热
+│       ├── project-config.mjs  # 读取 .electron-release.json
+│       └── powershell.mjs      # 受限沙箱下的 PowerShell 结果取回
 ├── references/
 │   ├── mechanism.md            # mac 机制速查 + 坑位清单
 │   └── windows.md              # Windows 分册：十阶段、NSIS、签名时序、云签名器、故障树

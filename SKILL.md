@@ -1,19 +1,21 @@
 ---
-name: electron-release  
-description: >-  
-  Electron 应用的打包、代码签名、公证（notarization）与发布。适用于任何基于  
-  Electron + electron-builder / Electron Forge / electron-packager 的项目。当用户要  
-  "打包 / 构建安装包 / 出 dmg / 出 mac app / 出 Setup.exe / 出 AppImage"、"签名 /  
-  公证 / notarize / staple / 去掉 Gatekeeper 拦截"、"发版 / 发布新版本 / 更新线上版本 /  
-  跑 release"、"自动更新问题（electron-updater 拉不到包 / latest-mac.yml 不可用 /  
-  检查更新失败 / 清单版本对不上）"时使用。覆盖 macOS（Developer ID + notarization +  
-  staple + entitlements）、Windows（NSIS + signtool / 云签名器 / 产物校验）、Linux  
-  产物，以及 GitHub Release / 自建更新源两种分发模式。  
-  触发词：打包、构建、打包发布、发版、发布、build、package、release、mac 应用、  
-  dmg、zip、nsis、pkg、appimage、electron-builder、electron-forge、electron-packager、  
-  notarize、公证、签名、stapler、staple、Gatekeeper、electron-updater、latest-mac.yml、  
-  latest.yml、blockmap、autoupdates、Setup.exe、Windows 安装包、signtool、  
-  SimplySign、云签名、Authenticode、代码签名证书、时间戳。  
+name: electron-release
+agent_created: true
+license: MIT
+description: >-
+  Electron 应用的打包、代码签名、公证（notarization）与发布。适用于任何基于
+  Electron + electron-builder / Electron Forge / electron-packager 的项目。当用户要
+  "打包 / 构建安装包 / 出 dmg / 出 mac app / 出 Setup.exe / 出 AppImage"、"签名 /
+  公证 / notarize / staple / 去掉 Gatekeeper 拦截"、"发版 / 发布新版本 / 更新线上版本 /
+  跑 release"、"自动更新问题（electron-updater 拉不到包 / latest-mac.yml 不可用 /
+  检查更新失败 / 清单版本对不上）"时使用。覆盖 macOS（Developer ID + notarization +
+  staple + entitlements）、Windows（NSIS + signtool / 云签名器 / 产物校验）、Linux
+  产物，以及 GitHub Release / 自建更新源两种分发模式。
+  触发词：打包、构建、打包发布、发版、发布、build、package、release、mac 应用、
+  dmg、zip、nsis、pkg、appimage、electron-builder、electron-forge、electron-packager、
+  notarize、公证、签名、stapler、staple、Gatekeeper、electron-updater、latest-mac.yml、
+  latest.yml、blockmap、autoupdates、Setup.exe、Windows 安装包、signtool、
+  SimplySign、云签名、Authenticode、代码签名证书、时间戳。
 ---
 
 # Electron 打包与发布
@@ -24,10 +26,11 @@ description: >-
 
 | 项        | 要求                                                    | 缺失时                    |
 | -------- | ----------------------------------------------------- | ---------------------- |
-| Node.js  | 建议 16+（仅 `probe.mjs` 需要；`verify-artifact.sh` 是纯 bash） | 自动降级为纯 bash 探测，能力缩减但可用 |
+| Node.js  | 脚本最低 16+；**构建**需 ≥ 20（electron-builder 25 要求） | 探测自动降级为纯 bash；构建流程明确停止 |
 | bash     | 必需（`verify-artifact.sh` / `install.sh`）               | 改用 npm 脚本手工执行          |
 | macOS 工具 | 签名验证需 `codesign`/`spctl`/`xcrun`（系统自带）                | 非 macOS 明确提示并改用对应平台命令  |
-| YAML 解析  | 清单校验需 `js-yaml`（多数 Electron 项目已装）或 `pyyaml`           | 两者皆无则明确报错，**不静默跳过**    |
+| YAML 解析  | 全部 Node 脚本自带最小解析器（零依赖，`scripts/lib/manifest.mjs`）；装了项目 `js-yaml` 会自动改用 | 内置解析器只认 electron-updater 固定形态；`verify-artifact.sh` 无 node 时退 `pyyaml`，两者都无才报错 |
+| 文件系统/权限 | 构建需要写项目输出目录，并 spawn `npm` / `electron-builder` | agent 的只读或仅工作区沙箱会失败：请在可写环境运行；`preflight-win-sign.mjs` 与 `verify-win-artifact.mjs` 已适配受限沙箱（结果走临时文件） |
 
 **平台无关性**：本文档不含任何特定 agent 或 IDE 的路径写死。脚本位置见 §1。
 
@@ -44,6 +47,7 @@ description: >-
 | 5 | **远端写操作前必须人工确认**。推 tag、建 Release、改线上清单都是不可逆的                            |
 | 6 | **未经验证的步骤不得写成结论**。项目自带的脚本可能没跑过，要标注                                      |
 | 7 | **校验脚本要先自证**。判定入口跨平台、成功路径必须有输出；无输出/静默 `exit 0` 一律当失败（§5.12）                |
+| 8 | **Windows 默认必须签名**。没有可用证书时 `build.mjs` 在构建前停止；确实不签名要显式 `--allow-unsigned` 或 `method:"none"`，并在报告里写明 SmartScreen 后果 |
 
 ---
 
@@ -51,43 +55,26 @@ description: >-
 
 ### 脚本路径
 
-本文档中的 `<SKILL_DIR>` = 本 skill 所在目录，即本 `SKILL.md` 文件的父目录。  
-各agent 的安装位置：
-
-按所在 agent 找本skill 目录：
-
-| Agent                    | 路径                                                               |
-| ------------------------ | ---------------------------------------------------------------- |
-| 通用（agents 规范，跨 agent 中枢） | `~/.agents/skills/electron-release`                              |
-| Claude Code              | `~/.claude/skills/electron-release`                              |
-| Codex                    | `~/.codex/skills/electron-release`                               |
-| Cursor                   | `~/.cursor/skills/electron-release`                              |
-| Windsurf                 | `~/.codeium/windsurf/skills/electron-release`                    |
-| Gemini CLI               | `~/.gemini/skills/electron-release`                              |
-| GitHub Copilot CLI       | `~/.config/github-copilot/skills/electron-release`               |
-| 项目级（随仓库分发）               | `<项目>/.agents/skills/electron-release` 或 `<项目>/.claude/skills/…` |
-
-一次性链接到全部已安装 agent：
+`<SKILL_DIR>` = 本 `SKILL.md` 的父目录。装到哪个 agent 由 `install.sh` 决定，不必背路径：
 
 ```bash
-bash <SKILL_DIR>/scripts/install.sh              # 自动探测并链接
-bash <SKILL_DIR>/scripts/install.sh --list# 查看支持项与本机状态
-bash <SKILL_DIR>/scripts/install.sh --copy       # 用复制（跨机/不支持软链时）
+bash <SKILL_DIR>/scripts/install.sh --list    # 查看支持项与本机状态（含 ~/.workbuddy/skills）
+bash <SKILL_DIR>/scripts/install.sh           # 自动探测并链接；--copy 用复制代替软链
 ```
 
-若路径报 `No such file`，直接定位：`find ~ -name probe.mjs -path "*electron-release*" 2>/dev/null`。
-
-若下述命令报 `No such file`，先定位：`find ~ -name probe.mjs -path "*electron-release*" 2>/dev/null`。
+若路径报 `No such file`：`find ~ -name probe.mjs -path "*electron-release*" 2>/dev/null`。
+各 agent 的完整路径表见 `README.md` 的安装章节（此处不再维护第二份）。
 
 ### 执行
 
 ```bash
-# 推荐：跨平台包装层，自动在 Node 与纯 bash 之间回退
+# macOS / Linux：推荐跨平台包装层，自动在 Node 与纯 bash 之间回退
 bash <SKILL_DIR>/scripts/probe.sh [项目根目录]
 bash <SKILL_DIR>/scripts/probe.sh . --json
 
-# 等价的直接调用（需 Node）
-node <SKILL_DIR>/scripts/probe.mjs[项目根目录]
+# Windows：直接跑 Node 版（Windows 上 bash 未必可用）
+node <SKILL_DIR>/scripts/probe.mjs [项目根目录]
+node <SKILL_DIR>/scripts/probe.mjs . --json
 ```
 
 只读，不执行构建、不修改文件。`probe.mjs` 零第三方依赖（自带 YAML 段解析器）；  
@@ -113,8 +100,14 @@ node <SKILL_DIR>/scripts/probe.mjs[项目根目录]
 
 ### 项目级配置（可选）
 
-若项目有 `.electron-release.json`，skill 会以其为准覆盖探测默认值。  
-模板见 `assets/project-config.template.json`。**不要把含凭据的配置提交到 git。**
+若项目有 `.electron-release.json`，`probe.mjs` / `build.mjs` / `preflight-win-sign.mjs` 都会读取：
+可覆盖 `build.outputDir`、`build.command`、签名证书（`signing.windows.*`）、
+`signing.windows.method: "none"`（明确声明不签名）、RFC3161 时间戳服务。
+字段清单与默认值见 `assets/project-config.template.json`。
+
+**证书来源优先级**：命令行（`--sign-sha1` / `--sign-subject`）> `SIGN_SHA1` / `WIN_SIGN_SHA1` >
+`.electron-release.json` > `package.json#build.win.signtoolOptions` > 证书存储里**唯一**一张可用证书。
+命中多张时脚本会停止并列出候选，**不会替你猜**。**不要把含凭据的配置提交到 git。**
 
 ---
 
@@ -138,6 +131,10 @@ security find-identity -v -p codesigning
 # F3' 签名证书（Windows，在 Windows 宿主执行）
 powershell -NoProfile -Command "Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.NotAfter -gt (Get-Date) } | Select-Object Subject,Thumbprint,HasPrivateKey,NotAfter | Format-List"
 
+# F3' 的推荐替代：skill 的 Windows 签名前置检查（含登录态/私钥/过期与来源判定）
+node <SKILL_DIR>/scripts/preflight-win-sign.mjs .            # 只检查
+node <SKILL_DIR>/scripts/preflight-win-sign.mjs . --warmup   # 额外预热 PIN（SimplySign 首次/换机）
+
 # F4 依赖
 test -d node_modules && echo OK
 
@@ -153,12 +150,13 @@ node -p "require('./package.json').author || '(缺失：CompanyName 会回落 Gi
 
 | 检查                       | 不通过                          |
 | ------------------------ | ---------------------------- |
-| Node < 20                | 停止，提示升级                      |
+| Node < 20（构建场景；仅跑探测/校验时 16+ 可用） | 停止，提示升级 |
 | node_modules 缺失          | 停止，询问是否 `npm install`        |
 | 测试失败                     | 停止并展示失败用例；**不得**擅自删除或跳过测试    |
 | 工作区脏（发布模式）               | 停止。**不得**自动 stash（可能丢失未提交改动） |
 | 无 Developer ID 但需公证      | 停止，进入 §4 说明阻塞                |
 | Windows 证书 `HasPrivateKey=False` | 停止：重导含私钥证书，或检查云签名器登录态（§4.6） |
+| Windows 无可用证书且未声明不签名 | **默认停止**（`build.mjs` 退出码 2）：先检查 SimplySign 登录态，或显式加 `--allow-unsigned` / 项目配置 `method:"none"` |
 | Windows 目标 + 含原生模块 + 非 Windows 宿主 | 停止：换宿主（§5.5）                   |
 | tag 与 package.json 版本不一致 | **必须人工确认**（这是已踩过的坑，见 §5.3）   |
 | `.bin` 无本平台 shim（`npm run` / `npx` 失效） | **不阻断**：改用 `node node_modules/electron-builder/cli.js`（§5.10）；`build.mjs` 会自动回退 |
@@ -173,34 +171,45 @@ node -p "require('./package.json').author || '(缺失：CompanyName 会回落 Gi
 **首选：`build.mjs` 一把梭**（自动处理脚本缺失与收尾）：
 
 ```bash
-node <SKILL_DIR>/scripts/build.mjs[选项] [项目根目录]
+node <SKILL_DIR>/scripts/build.mjs [选项] [项目根目录]
 ```
 
-它会自动完成：探测 → 跑测试 → 选构建命令 → 构建 → **收尾** → 校验 → 批次核对。
+它会自动完成：探测 → **Windows 签名预检** → 跑测试 → 选构建命令 → 构建 →
+**收尾** → **产物校验** → 批次核对。
 
 | 选项 | 说明 |
 |---|---|
-| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）。选项与位置参数顺序无关，`--platform win .` 与 `. --platform win` 等价。**要出两平台安装包请分别跑两次**：`all` 的收尾只读 mac 清单（`latest-mac.yml`），且共用同一个 `package/` 会互相覆盖 |
-| `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`） |
-| `--name-prefix <前缀>` | 指定产物 ASCII 前缀（默认从包名/appId 推断） |
-| `--skip-tests` | 跳过单元测试 |
-| `--no-finalize` | 只构建，不做收尾与校验 |
-| `--dry-run` | 只打印将执行的步骤 |
+| `--platform mac\|win\|linux\|all` | 构建平台（默认 mac）。要出两平台包请**分别跑两次**：`all` 的收尾只读 `latest-mac.yml`，且共用 `package/` 会互相覆盖 |
+| `--out <目录>` | 收尾产物目录（默认 `<outputDir>/package`；**不再**影响 builder 输出目录） |
+| `--skip-build` / `--skip-tests` | 只做收尾 + 校验（重跑收尾/补验） / 跳过单元测试 |
+| `--dry-run` | 只打印将执行的步骤（含选中的脚本与签名来源，不做预热） |
+| `--sign-sha1` / `--sign-subject` / `--warmup` | 指定指纹 / 按 Subject 选证书 / 预热 PIN |
+| `--skip-sign` / `--allow-unsigned` | 不签名（同时剥离凭据变量） / 无证书仍继续 |
+| `--expect-arch x64\|arm64` / `--strict` | 架构断言 / 校验出现 SKIP 也算失败 |
 
-**它解决的四个高频问题**（依次对应 §5.7 / §5.8 / §5.10 / §5.9）：
+完整选项（`--no-finalize`、`--no-verify`、`--name-prefix`、`--timestamp-url`、
+`--allow-cross-build` 等）见 `node <SKILL_DIR>/scripts/build.mjs --help`——脚本头注释是唯一真相来源，
+本文档不复制，避免再次漂移。
 
-1. **打包脚本只在部分分支上存在** —— 自动按`package` → `build:mac` → 裸
-   `electron-builder` 的优先级选择，并在缺失时说明「本脚本将补齐收尾」
-2. **裸 builder 不做收尾** —— 无论用了哪个命令，都由本脚本统一执行：
-   以清单 `files[]` 为权威来源收齐 → ASCII 改名（含 `.blockmap` 同步改名）→
-   YAML 解析改写 url → 逐条校验 sha512
-3. **`npm run` / `npx` 在本机不可用**（`.bin` 缺本平台 shim，见 §5.10）—— 仅当失败信息
-   属 shim 类（`不是内部或外部命令` / spawn `ENOENT` / `Missing script: <本次请求的脚本>`）时
-   回退到 `node node_modules/electron-builder/cli.js`；项目自身编译报错（如 `Cannot find module`）
-   或**脚本内部子脚本缺失**（`Missing script: electron:build`）**不触发回退**，
-   否则会绕过前端构建、把上一次的旧产物打进安装包
-4. **Windows rcedit 被实时防护锁定**（见 §5.9）—— 解析日志里的原始 rcedit 命令行退避补写，
-   再用 `--prepackaged <outputDir>/win-unpacked` 只补跑分发目标，避免整包重跑再次触发锁
+**默认安全姿态**：`--platform win` 时若证书存储里没有可用证书、项目也没声明不签名，
+脚本会在构建**之前**以退出码 2 停止 —— 避免“构建成功但产物未签名、仍被当成可分发”。
+确实不签名时用 `--allow-unsigned`，或在 `.electron-release.json` 里写 `signing.windows.method: "none"`。
+
+**它解决的问题**（细节依次见 §5.7 / §5.8 / §5.10 / §5.9）：① 打包脚本只在部分分支存在 →
+优先平台专属脚本，再退通用脚本、裸 builder；② 裸 builder 不做收尾 → 统一由本脚本按清单
+`files[]` 收齐、ASCII 改名、改写清单、逐条校验 sha512；③ `npm run` / `npx` 在本机失效 →
+**只在 shim 类报错**时回退 `node cli.js`，项目自身编译报错或子脚本缺失**不回退**（否则会把上一次
+旧产物打进包）；④ Windows rcedit 被实时防护锁定 → 解析原始命令行退避补写，再 `--prepackaged`
+只续跑分发目标。
+
+**Windows 签名参数注入**：`build.mjs` 会解析出证书后自动追加
+`--c.win.signtoolOptions.certificateSha1=<指纹>` 与
+`--c.win.signtoolOptions.rfc3161TimeStampServer=<URL>`，npm 脚本、`node cli.js` 回退、
+`--prepackaged` 续跑三条路径都会带上同一组参数。**不需要改项目的 `package.json`。**
+
+项目脚本里若显式写了 `--publish always` / `--publish onTag`，脚本会打印「会触发远端发布」的
+警告（不改写项目命令）。需要完全隔离时，用 `--skip-build` 只做收尾，或改走 `--no-finalize`。
+
 
 Windows 上一次成功构建的真实输出长这样（可用来对照是否走到兜底分支）：
 
@@ -213,16 +222,17 @@ Windows 上一次成功构建的真实输出长这样（可用来对照是否走
 ✓ idea-note-Setup-1.1.1.exe  94MB
 ```
 
-**手动等价流程**（需要自己控制时用）：
+**手动等价流程**：先看 `package.json#scripts` —— 有平台脚本（`dist:win` / `build:mac` / `package`）
+就优先用它；只有 `build` 说明只编译，**收尾必须自己做**；都没有则 `npx electron-builder --<平台>`。
+最常用的两条命令：
 
 ```bash
-# 1. 先看项目提供了什么
-node -e "console.log(Object.entries(require('./package.json').scripts||{}).map(([k,v])=>k+': '+v).join('\n'))"
-```
+# 只看会做什么（含选中的脚本、证书来源）
+node <SKILL_DIR>/scripts/build.mjs --platform win --dry-run <项目>
 
-- 项目有 `package` 脚本 → 优先用它（自带收尾）
-- 只有 `build:mac` / `build` → 只构建，**收尾需自己做**
-- 都没有 → `npx electron-builder --mac`
+# 真正构建（自动预检证书 → 注入签名参数 → 构建 → 收尾 → 产物校验）
+node <SKILL_DIR>/scripts/build.mjs --platform win --expect-arch x64 <项目>
+```
 
 ⚠️ **无论走哪条路径，收尾都不能省**。`build:mac` 与裸 `electron-builder` 都不会
 产 ASCII 名与配对清单，直接投放会导致客户端 sha512 校验失败。
@@ -250,6 +260,8 @@ node <SKILL_DIR>/scripts/verify-win-artifact.mjs \
 
 Windows 侧不要只确认"清单存在"——签名时序错误、混入旧批次、架构不符都不会让构建失败，
 只会在客户端更新或启动时暴露。必须跑上面的脚本做产物级断言。
+`build.mjs --platform win` 已在收尾后**自动调用它**：任何 FAIL（或 `--strict` 下的 SKIP）
+都会让本次构建以非 0 退出，不需要再手工跑一遍。
 
 两个容易误判的点：
 
@@ -401,37 +413,35 @@ xcrun stapler staple dist/*.dmg && xcrun stapler validate dist/*.dmg
 
 ### 4.6 Windows 签名
 
-> 完整机制、NSIS 默认值、云签名器细节与故障树见 `references/windows.md`。
+三条路径选一条。`certificateSha1` 一旦设置即独占来源，**不会**回退 PFX / `WIN_CSC_LINK`：
 
-**三条路径选一条。** `certificateSha1` 一旦设置即独占来源，不会回退 PFX / `WIN_CSC_LINK`：
-
-| 路径 | 配置 | 适用 |
+| 路径 | 关键配置 | 适用 |
 |---|---|---|
 | 证书存储 | `signtoolOptions.certificateSha1`（或 `certificateSubjectName`） | 构建机已导入含私钥的证书 |
 | PFX 文件 | `signtoolOptions.certificateFile` + 密码，或 `WIN_CSC_LINK` + `WIN_CSC_KEY_PASSWORD` | CI / 临时构建机 |
-| 云签名器 | 同"证书存储"，但证书由 SimplySign 等客户端挂进 `Cert:\CurrentUser\My` | 私钥在云端 HSM |
+| 云签名器 | 同「证书存储」，证书由 SimplySign 等挂进 `Cert:\CurrentUser\My` | 私钥在云端 HSM |
+
+证书来源的五级解析顺序（命令行 → 环境变量 → 项目配置 → `package.json` → 存储中唯一可用证书）、
+SimplySign 登录态与 PIN 缓存、`After Private Key filter, 0 certs were left` 的两种成因、
+`publisherName` 与 RFC3161 时间戳要求，见 `references/windows.md` §5.2–§5.6。
+
+**一键流程（不改项目 `package.json`，不把指纹写进任何脚本）**：
 
 ```bash
-# PFX 方案
-export WIN_CSC_LINK=/path/to/cert.pfx WIN_CSC_KEY_PASSWORD=***
+node <SKILL_DIR>/scripts/preflight-win-sign.mjs <项目> --warmup   # 首次/换机：验证登录态 + 预热 PIN
+node <SKILL_DIR>/scripts/build.mjs --platform win --expect-arch x64 <项目>   # 解析证书→注入参数→构建→收尾→校验
 ```
 
-**三条硬约束：**
+**三条硬约束**（违反任一条：构建能过，客户端更新必挂）：
 
-1. **签名必须由 electron-builder 在生成 blockmap / latest.yml 之前完成。**
-   构建后用脚本重签会改变哈希，清单 sha512 与产物不一致，客户端更新必失败。
-2. **`publisherName` 必须与证书 Subject 完全一致**（建议完整 DN，不只写 CN），
-   否则 electron-updater 拒绝更新包。
-3. **必须在 Windows 宿主构建**，见 §5.5。
+1. 签名必须由 electron-builder 在生成 blockmap / `latest.yml` **之前**完成。构建后重签会改变哈希，
+   清单 sha512 与产物不一致。
+2. `publisherName` 必须与证书 Subject 完全一致（建议完整 DN，不要只写 CN）。
+3. 必须在 Windows 宿主构建，见 §5.5。
 
-**云签名器（SimplySign 等）额外要求：**
-
-- 客户端保持登录——掉线即私钥不可用，报 `After Private Key filter, 0 certs were left`
-- 开启 PIN 缓存（约 3 小时），并在构建前**预热签一次**；否则构建卡在
-  `Submitting digest for signing...`，表现为无响应而非报错
-- 用 64 位 signtool（builder 自带 `windows-10/x64/signtool.exe`）
-
-未签名的 exe 会触发 SmartScreen；新证书即使已签名，信誉积累期仍可能提示。这是预期行为。
+云签名器额外要求：客户端保持登录（掉线即私钥不可用）、PIN 缓存开启并预热（否则卡在
+`Submitting digest for signing...`，表现为**无响应**而非报错）、用 64 位 signtool。
+未签名的 exe 会触发 SmartScreen；新证书即使已签名，信誉积累期仍会提示——都是预期行为。
 
 ---
 
@@ -439,21 +449,14 @@ export WIN_CSC_LINK=/path/to/cert.pfx WIN_CSC_KEY_PASSWORD=***
 
 ### 5.1 产物不可复现
 
-同版本两次构建 sha512 不同（时间戳、asar 顺序、zip 元数据）。  
+同版本两次构建 sha512 不同（时间戳、asar 顺序、zip 元数据）。
 **清单必须与当次产物成对发布，禁止复用旧资产目录。**
 
 ### 5.2 清单改写会破坏结构（高频事故）
 
-逐行文本替换会把缩进错位的 `sha512`/`size` 并进 `url`：
-
-```yaml
-# 损坏的清单 —— 客户端解析必失败
-files:
-  - url: idea-note-1.1.1.dmg sha512: xxxxx size: 123
-```
-
-正确做法见 `references/mechanism.md` §3.3，或直接复用项目里已有的清单改写脚本  
-（若项目已封装，优先用它）。
+逐行文本替换会把缩进错位的 `sha512`/`size` 并进 `url`，产出客户端无法解析的清单
+（表现为「检查更新永远失败」或「下载后校验不通过」）。必须 YAML 解析 → 改 → 序列化：
+统一实现是 `scripts/lib/manifest.mjs`，机制说明见 `references/mechanism.md` §3.3。
 
 ### 5.3 版本号与 tag 脱节（真实踩过的坑）
 
@@ -476,19 +479,14 @@ tag 必须**先于** Release 推送。顺序反了会导致 gh 在旧提交上�
 
 ### 5.5 Windows 交叉构建的边界
 
-| 项目特征 | 能否在 macOS/Linux 上产出可用 Windows 包 |
-|---|---|
-| 纯 JS 依赖 | 可（Wine + NSIS），但属非官方路径，需实测 |
-| 含原生模块（`better-sqlite3` / `bufferutil` / `node-screenshots` 等） | **不可** |
-
+纯 JS 依赖可尝试 Wine + NSIS（非官方路径，需实测）；**含原生模块一律不可**：
 `@electron/rebuild` 在 `rebuilder.platform !== process.platform` 时直接抛错。
-更隐蔽的是**部分成功**：有匹配 prebuild 的模块拿到 win32 二进制，没有的才回退 node-gyp 失败。
+更隐蔽的是**部分成功**——有 prebuild 的模块拿到 win32 二进制，没有的回退 node-gyp 失败；
+失败还会把 `node_modules/<native>/build/Release/*.node` 换成 PE DLL，同一份 `node_modules`
+回 macOS 立即不可用。
 
-**副作用**：失败会把 `node_modules/<native>/build/Release/*.node` 换成 PE DLL，
-同一份 `node_modules` 在 macOS 上立即不可用，需按项目脚本重建 ABI。
-
-发布用途的 Windows 包一律在 Windows 宿主构建；构建脚本应在非 Windows 宿主上
-**快速失败并说明原因**，而不是"试一下"。**若无法验证，明确告知用户，不要假装成功。**
+发布用途的 Windows 包一律在 Windows 宿主构建；非 Windows 宿主应**快速失败并说明原因**，
+而不是"试一下"。机制细节见 `references/windows.md` §1。
 
 ### 5.6 公证静默跳过
 
@@ -528,177 +526,70 @@ git merge-base --is-ancestor <引入脚本的commit> HEAD && echo "在" || echo 
 **核对批次**：
 
 ```bash
-stat -f '%Sm' dist/package/latest-mac.yml# macOS
+stat -f '%Sm' dist/package/latest-mac.yml   # macOS
 # 清单时间早于本次构建开始时间 → 旧批次，必须重建
 ```
 
 `build.mjs` 会自动判断并在必要时重建收尾目录。
 
-### 5.9 Windows：rcedit `Unable to commit changes`（实时防护瞬时锁）
+### 5.9 Windows：rcedit `Unable to commit changes`
 
-**现象**：打包到最后阶段（写 exe 版本信息 / 图标）失败，exe 仍是 Electron 原始元数据：
+打包末尾写 exe 版本资源失败，日志为 `Fatal error: Unable to commit changes`——**与证书无关**，
+却常被误判成签名问题。根因是实时防护（火绒 / 电脑管家 / Defender）对刚写入的大 exe 瞬时独占。
 
-```
-⨯ cannot execute  cause=exit status 1
-  errorOut=Fatal error: Unable to commit changes
-  command='...\winCodeSign-2.6.0\rcedit-x64.exe' '...\release\win-unpacked\MyApp.exe'
-          --set-version-string FileDescription '...' --set-icon '...'
-⨯ Above command failed, retrying 3 more times
-```
+处置（`build.mjs --platform win` 已内置）：从日志抠出 rcedit **原始命令行**（不要硬编码参数）→
+按 `[0, 8, 8, 10, 12, 15, 20, 25]` 秒退避重试（每次先 `open(exe,'r+')` 探测占用）→ 成功后用
+`--prepackaged` 只续跑 nsis/zip，**不要整包重跑**（会重新拷贝 exe，必然再触发一次锁）。
 
-**根因**（已用对照实验确认，不是 rcedit 版本/参数/路径/磁盘空间问题）：刚写入的大 exe
-（几十 MB ~ 200 MB）被实时防护（火绒 `wsctrl*`、腾讯电脑管家 `QPCTray`、Defender）
-**瞬时独占**，`EndUpdateResourceW` 拿不到独占写。证据：
-
-- 同一文件 fail 后等 8~30 秒手动重跑同一条命令**必成功**
-- `rcedit 0.2.0` 与 `2.0.0` 行为一致，参数逐字相同
-- electron-builder 内部共 4 次尝试（日志 `retrying 3 more times`），实测全部在约 1 秒内结束，赶不上防护释放
-
-**处置**（`build.mjs` 已内置，`--platform win` 时自动生效）：
-
-1. 从日志正则抠出失败的 rcedit **原始命令行**——不要自己硬编码 `--set-version-string` 参数，
-   品牌信息在 `package.json` 里，硬编码会与 builder 生成的元数据不一致；
-   参数按单引号分段，兼容含空格与中文的路径。
-2. 按 `[0, 8, 8, 10, 12, 15, 20, 25]` 秒退避重试；每次重试前先试 `open(exe, 'r+')` 探测是否仍被独占。
-3. 补写成功后**不要重跑整包**（会重新拷贝 exe，必然再触发一次锁），
-   改用 `electron-builder --win --prepackaged <outputDir>/win-unpacked` 只补跑 nsis/zip 目标。
-
-**更彻底的解法**：把项目目录与输出目录加入安全软件信任区，触发条件消失后兜底不会走到。
-
-**自检兜底是否真生效**：不能只看退出码，要核对 exe 元数据（见 §5.11 的命令）。
+对照实验、判断依据与「加入信任区」的彻底解法见 `references/windows.md` §5.7。
 
 ### 5.10 node_modules 跨平台拷贝 → `npm run` / `npx` 全部失效
 
-**现象**（Windows 宿主，`node_modules` 从 macOS 机器整体拷来）：
+`node -v` 正常，但 `'electron-builder' 不是内部或外部命令`：`.bin` 里的 shim 与
+`electron/dist/` 都是**平台相关**的。判据：`ls node_modules/.bin | grep -c '\.cmd$'` 为 0。
 
-```
-> electron-builder --win
-'electron-builder' 不是内部或外部命令，也不是可运行的程序
-```
-
-`npx electron-builder --version`、`npm start` 同样失效，但 `node -v` 正常，极易误判为环境问题。
-
-**根因**：`node_modules/.bin/` 里的 shim 是**平台相关**的——mac 上是无扩展名的符号链接，
-Windows 上必须是 `.cmd` / `.ps1`；`libuv` 只补 `.exe`，不认 PATHEXT，所以连 `npm` 都 spawn 不到
-（脚本里 `spawnSync('npm', …)` 会 `ENOENT`）。同时 `node_modules/electron/dist/` 是 mac 的
-`Electron.app`，没有 `electron.exe`，冒烟测试也跑不了。
-
-**处置**：
-
-| 场景 | 做法 |
-|---|---|
-| 只想打包 | 绕过 shim：`node node_modules/electron-builder/cli.js --win --publish never`（`build.mjs` 命中 shim 类报错 / spawn ENOENT 会自动回退；项目自身编译报错不回退） |
-| 需要 `npm start` / 冒烟测试 / 长远使用 | 在 Windows 上重跑 `npm ci`（会重写 `node_modules`，**会破坏 mac 侧那份**，先确认） |
-| 脚本内 spawn | Windows 上 `npm` 实为 `npm.cmd`；`shell:false` 会 ENOENT，而 Node ≥18.20 又禁止无 shell 执行 `.cmd`（CVE-2024-27980）——必须 `shell:true`，且带空格的参数要自行加引号 |
-
-判断依据（一行）：
-
-```bash
-ls node_modules/.bin | grep -c '\.cmd$'   # 0 → 不是 Windows 装的
-```
+只打包可绕过 shim 用 `node node_modules/electron-builder/cli.js --win`（`build.mjs` 已按报错特征
+自动回退）；要长期用则在 Windows 上 `npm ci`（会重写 `node_modules`，mac 侧那份随即失效）。
+脚本内 `spawnSync('npm')` 需 `shell:true`（Node ≥18.20 禁止无 shell 执行 `.cmd`）。
+细节见 `references/windows.md` §1.1。
 
 ### 5.11 缺 `author` → 发布者回落 `GitHub, Inc.`
 
-electron-builder 用 `author` 生成 exe 的 `CompanyName`、`LegalCopyright` 与 NSIS 卸载项的
-发布者。缺这个字段时构建**不会失败**，只打一行 warn，产物里却是 Electron 的默认值：
+构建**不失败**，只打一行 `author is missed`，但 exe 的 `CompanyName` / `LegalCopyright`
+与卸载项发布者全是 Electron 默认值。**必须在打包前补** `"author"`——该值会进 rcedit 参数，
+事后单改 exe 会与 NSIS 侧不一致。
 
-```
-• author is missed in the package.json  appPackageFile=.../package.json
-→ CompanyName=GitHub, Inc.  LegalCopyright=Copyright © 2026 <productName>
-```
-
-**处置**：在 `package.json` 补 `"author": "<组织或人名>"` 后重建。
-补 `author` 会连带把 `--set-version-string CompanyName` 带进 rcedit 参数，
-所以**必须在打包前补**，事后单独改 exe 元数据容易与 NSIS 侧不一致。
-
-核对（Windows 宿主）：
-
-```powershell
-(Get-Item .\release\win-unpacked\MyApp.exe).VersionInfo |
-  Format-List FileVersion,ProductVersion,ProductName,CompanyName,FileDescription
-```
-
-期望：`FileVersion` = package.json 版本，`CompanyName` = author，`ProductName` = productName。
-若仍是 `FileVersion=33.x / CompanyName=GitHub, Inc.`，说明 rcedit 没写成功（回 §5.9）。
+核对（Windows）：`(Get-Item .\release\win-unpacked\MyApp.exe).VersionInfo | Format-List`，
+`FileVersion` 应为 package.json 版本、`CompanyName` 应为 author。成因与配置面见
+`references/windows.md` §3.0。
 
 ### 5.12 校验脚本也会说谎：必须验证「脚本真的跑了」
 
-真实事故：`verify-win-artifact.mjs` 的入口判定写成
+真实事故：入口判定写成 `resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)`。
+macOS 下同形可用；Windows 下 `pathname` 是 `/C:/…`，永不相等 → `main()` 不执行、进程 **exit 0**，
+于是「校验通过」其实是「什么都没校验」，比校验失败危险得多。现已改为 `fileURLToPath` +
+`realpathSync` 归一，并加「疑似入口却未匹配 → exit 2」的硬报错。
 
-```js
-const isCli = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-```
+规则（任何自写校验脚本都适用）：入口用 `fileURLToPath`；**成功路径必须至少有输出**；
+新写/改写的脚本先用一个**已知不合格**的产物跑一遍，确认它真的会 FAIL。事故复盘见
+`references/windows.md` §7.2。
 
-macOS 下 `pathname` 与 `argv[1]` 同形，能正常工作；**Windows 下 `pathname` 是 `/C:/x/a.mjs`**，
-与 `C:\x\a.mjs` 永不相等 → `main()` 不执行，进程以 **0** 退出。于是「校验通过」其实是
-「什么都没校验」，比校验失败危险得多。
-
-现已修复为 `fileURLToPath` + `realpathSync` 归一化（Windows 下再转小写），并加了一道
-「疑似入口却没匹配上 → exit 2」的硬报错。
-
-**通用要求**（任何自写校验脚本都适用）：
-
-- 判定入口不要用 `new URL(import.meta.url).pathname`；用 `fileURLToPath`
-- **成功路径必须至少有输出**。拿不到预期输出就当失败，不要 `exit 0`
-- 新增校验脚本时，先用一个**已知不合格**的产物跑一遍，确认它真的会报 FAIL ——
-  「永远通过」的脚本等于没有脚本
 ---
 
 ## 6. 人工介入（不可自动化）
 
-> 每项都需人工操作或明确口头确认。AI 不得代为执行含凭据或远端写操作的动作。
+> 每项都需人工操作或明确口头确认；AI 不得代为执行含凭据或远端写操作的动作。
+> Windows 侧的判定细节见 `references/windows.md` §10。
 
-### 🔧 M1 · 注入发布凭据
-
-**触发**：首次执行发布前，或更换服务器/密钥后。  
-**前置**：拿到服务器访问方式（IP、用户、密钥路径）。  
-**为何人工**：涉及服务器凭据与内网信息。  
-**失败处理**：连接失败 → 核对 IP/端口/密钥；域名被本地代理劫持时 `host` 填真实 IP。  
-**禁止**：把凭据写进 `package.json`、`.yml` 或任何入库文件。
-
-
-### 🔑 M2 · 发布平台登录鉴权
-
-**触发**：发 GitHub Release 前。  
-**前置**：`gh` 已安装；账号对目标仓库有 **Write 及以上**权限。  
-**操作**：`gh auth login`。  
-**失败处理**：权限不足时脚本/命令会报错 →换账号或授权，**不要**绕过权限检查。
-
-### 📝 M3 · 确认版本号
-
-**触发**：发布前。  
-**前置**：确定 bump 类型（修复→patch / 新功能→minor / 不兼容→major）。  
-**为何人工**：版本号是对外契约，误发布会推给所有用户。  
-**强制约束**：**必须严格递增**，否则客户端不会触发升级。  
-**失败处理**：tag 已存在 → 换更高版本号。**不要**删已发布 tag（破坏可追溯性）。
-
-### 🔏 M4 · 证书主体确认
-
-**触发**：启用签名前。  
-**前置**：确认证书归属主体是否为本人/本组织，且有分发授权。  
-**为何人工**：用他人主体的证书签名分发涉及法律风险。  
-**失败处理**：主体不符 → 采购自己的证书，不要借用。
-
-### 🌍 M5 · 环境差异确认
-
-**触发**：跨平台构建；切换构建机；首次在新机器上发布。  
-**需确认**：① 目标平台能否在本机构建；② 证书是否就位；③ 更新源是否可达；④ 产物命名与更新清单是否匹配。  
-**失败处理**：不具备条件时**停止并告知**，不要产出未经验证的包。
-
-### 🚦 M6 · 发布放行
-
-**触发**：任何远端写操作**之前**。  
-**需确认**：① 版本号正确；② 清单与产物 sha512 配对通过；③ 目标地址正确；④ 知晓远端将出现新 tag / Release。  
-**为何人工**：不可逆。
-
-### 🖐 M7 · 云签名器登录 / PIN
-
-**触发**：使用 SimplySign 等云签名器，或首次在打包机上签名。  
-**前置**：客户端已安装并登录；证书在 `Cert:\CurrentUser\My` 可见且 `HasPrivateKey=True`。  
-**操作**：先对任意已有 exe 手工签一次，完成 PIN/手机确认（PIN 缓存约 3 小时）。  
-**为何人工**：OTP/PIN 在手机上，不能入库，也不能由脚本代按。  
-**失败处理**：`After Private Key filter, 0 certs were left` → 重新登录，或换 64 位 signtool；  
-构建卡在 `Submitting digest for signing...` → 预热未完成，回到本节第一步。
+| # | 事项 | 触发 / 前置 | 关键约束 |
+|---|---|---|---|
+| M1 | 注入发布凭据 | 首次发布、换服务器或密钥 | 凭据不得进 `package.json` / `.yml` / 任何入库文件；域名被本地代理劫持时 `host` 填真实 IP |
+| M2 | 平台登录鉴权 | 发 Release 前 | `gh auth login`；账号需 Write 及以上权限，**不得绕过**权限检查 |
+| M3 | 确认版本号 | 发布前 | 必须严格递增；tag 已存在就换更高版本，**不删**已发布 tag |
+| M4 | 证书主体确认 | 启用签名前 | 主体须为本人/本组织且有分发授权；不借用他人证书 |
+| M5 | 环境差异确认 | 跨平台构建 / 换构建机 / 新机器首发 | 本机能否构建、证书是否就位、更新源是否可达、命名与清单是否匹配；不具备就**停止并告知** |
+| M6 | 发布放行 | 任何远端写操作**之前** | 版本号、sha512 配对、目标地址、将出现的新 tag / Release 全部确认（不可逆） |
+| M7 | 云签名器登录 / PIN | SimplySign 等 / 首次在打包机签名 | 先手工签一次完成 OTP/PIN（缓存约 3h）；卡在 `Submitting digest for signing...` 即预热未完成 |
 
 ---
 
@@ -764,16 +655,30 @@ Windows 未签名产物要额外明说一句：**首次安装会被 SmartScreen 
 | ------------------------------------- | ------------------------------------------- | --------------- |
 | `scripts/probe.sh`                    | 项目画像探测（推荐入口，自动回退）                           | bash，可无 Node    |
 | `scripts/probe.mjs`                   | 项目画像探测核心实现（含发布者 `author` 缺失告警）              | Node 16+，零依赖    |
-| `scripts/build.mjs`                   | 一键构建：选命令 → 构建 → 收尾 → 校验；Windows 下自动处理 npm shim 回退与 rcedit 锁定 | Node 16+ |
+| `scripts/preflight-win-sign.mjs`      | Windows 签名前置检查：证书可见性/私钥/过期、来源判定、`--warmup` 预热 PIN | Node 16+，Windows |
+| `scripts/build.mjs`                   | 一键构建：签名预检 → 选命令 → 构建（注入签名参数）→ 收尾 → 产物校验；含 npm shim 回退与 rcedit 锁定兜底 | Node 16+ |
 | `scripts/verify-artifact.sh`          | 产物验证：签名 / 公证 / staple / 清单配对（macOS 为主）      | bash + macOS 工具 |
 | `scripts/verify-win-artifact.mjs`     | Windows 产物验证：清单 / sha512 / PE（NSIS 看载荷）/ blockmap / Authenticode；`--allow-unsigned`；入口自检 | Node 16+，零依赖 |
+| `scripts/manifest-cli.mjs`            | 清单 ↔ 产物配对校验 CLI（`verify-artifact.sh` 调用；输出 ✓/✗/! 行，`--json` 可结构化） | Node 16+，零依赖 |
+| `scripts/lib/manifest.mjs`            | 清单解析/序列化的唯一实现：`parseManifest` / `dumpManifest` / `createCodec` / `sha512File`（被 build / verify-win / manifest-cli 复用） | Node 16+，零依赖 |
+| `scripts/lib/windows-sign.mjs`        | 证书枚举、签名来源解析、builder 参数拼装、预热（被 preflight/build 复用） | Node 16+，Windows |
+| `scripts/lib/project-config.mjs`      | 读取 `.electron-release.json`                     | Node 16+      |
+| `scripts/lib/powershell.mjs`          | 受限沙箱下用临时文件取回 PowerShell 结果（避开管道 EPERM）      | Node 16+，Windows |
 | `scripts/install.sh`                  | 链接到各 agent 的技能目录                            | bash            |
+| `tests/smoke.mjs`                     | 可复跑自测：清单配对 / 退出码 / ASCII 改名 / 清单改写 / 跨脚本契约（合成夹具，3 秒） | Node 16+，零依赖，不联网 |
 | `references/mechanism.md`             | 机制速查：公证流程、凭据、entitlements 模板、清单结构、平台差异、坑位清单 | —               |
 | `references/windows.md`               | Windows 分册：平台边界、依赖跨平台、十阶段流水线、NSIS 默认值、签名时序、rcedit 锁、云签名器、故障树 | —               |
 | `assets/project-config.template.json` | 项目级配置模板                                     | —               |
 
 **验证环境**：electron-builder 25.1.8 / @electron/notarize 2.5.0 / Electron 33.4.11 /  
 macOS 15.7.8 / Windows 11 (26200) / Node 22。
+
+改完脚本先跑 `node tests/smoke.mjs`（合成夹具，10 项契约断言，不联网、不碰真实项目）；
+它通过只说明脚本自身没坏，不替代真实项目的端到端打包。
+
 Windows 侧已用真实项目跑通 `build.mjs --platform win` 端到端（含 npm shim 回退、rcedit 退避补写、
 `--prepackaged` 续跑、ASCII 改名 + blockmap + latest.yml 配对）。
+签名注入链路（证书存储 → builder 参数 → 三路径回退）已用合成产物验证到
+「校验脚本能区分已签名/未签名」；**真实证书 + SimplySign PIN 交互需在打包机上验证**，
+无证书时应如实报告"未验证"，不要写成通过。
 其他版本的机制细节（尤其公证字段默认值）**需读该项目的 node_modules 源码确认**，不要照搬本文档。

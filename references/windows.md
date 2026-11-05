@@ -74,9 +74,9 @@ ls node_modules/electron/dist/electron.exe # 缺失同上
 | 4 | 子模块/附带应用构建 | 项目脚本 | 产物目录必须与 `extraResources.from` 对齐 |
 | 5 | 应用编译 | `electron-vite build` / `vite build` | 主/preload/renderer 三份产物齐全 |
 | 6 | 打包 | `electron-builder --win nsis --x64 --publish never` | `--publish never` 阻断自动上传 |
-| 7 | 签名 | electron-builder 内部 `signIf` | **必须早于 blockmap / latest.yml** |
+| 7 | 签名 | electron-builder 内部 `signIf` | **必须早于 blockmap / latest.yml**；`build.mjs` 自动注入证书与时间戳参数 |
 | 8 | 更新元数据 | 自动生成 `.blockmap` + `latest.yml` | `sha512` 基于**已签名**字节 |
-| 9 | 产物校验 | `verify-win-artifact.mjs` | 见 §7 |
+| 9 | 产物校验 | `verify-win-artifact.mjs` | 见 §7；`build.mjs` 收尾后自动调用 |
 | 10 | 发布 | 项目自定 | 与构建解耦，失败可单独重跑 |
 
 ### 2.1 为什么要 `npm ls --omit=dev`
@@ -253,6 +253,28 @@ signtool sign /sha1 "<THUMBPRINT>" /fd sha256 `
 不预热时，electron-builder 会卡在 `Submitting digest for signing...`，表现为"构建无响应"，
 而不是报错——这是无人值守场景最容易误判的失败形态。
 
+#### skill 的通用化流程（不需要改项目 `package.json`）
+
+原项目脚本（如 `build-and-publish-win.py`）是在命令行注入
+`--c.win.signtoolOptions.certificateSha1`；本 skill 把这步拆成「预检 + 自动注入」：
+
+```bash
+# ① 检查登录态 / 证书可见性 / 私钥 / 过期；--warmup 会触发 PIN 与手机确认
+node <SKILL_DIR>/scripts/preflight-win-sign.mjs <项目> --warmup
+
+# ② 打包：自动解析证书 → 注入参数 → 构建 → 收尾 → 产物校验
+node <SKILL_DIR>/scripts/build.mjs --platform win --expect-arch x64 <项目>
+```
+
+| 环节 | 行为 |
+|---|---|
+| 证书来源 | 命令行 `--sign-sha1` / `--sign-subject` → `SIGN_SHA1` / `WIN_SIGN_SHA1` → `.electron-release.json` → `package.json#build.win.signtoolOptions` → 存储唯一证书 |
+| 参数注入 | `--c.win.signtoolOptions.certificateSha1=<sha1>` + `--c.win.signtoolOptions.rfc3161TimeStampServer=<url>`，npm 脚本 / `node cli.js` / `--prepackaged` 三条路径都带 |
+| 无证书 | **构建前停止**（退出码 2），除非 `--allow-unsigned` 或项目声明 `signing.windows.method:"none"` |
+| 多证书 | 停止并列出候选，要求 `--sign-sha1`（不猜主体，避免签错） |
+| 预热 | `--warmup` 用 builder 缓存里的 64 位 signtool 对临时副本签一次，成功后删除副本 |
+| 产物校验 | 收尾后自动跑 `verify-win-artifact.mjs --json-out`；FAIL / `--strict` SKIP 都会让构建失败 |
+
 ### 5.4 `After Private Key filter, 0 certs were left` 的两种成因
 
 | 情形 | 特征 | 处理 |
@@ -353,6 +375,9 @@ releaseDate: '2026-10-29T00:00:00.000Z'
 node <SKILL_DIR>/scripts/verify-win-artifact.mjs --dir release --expect-version 1.2.3
 ```
 
+`build.mjs --platform win` 在收尾后会自动调用本脚本（`--json-out` 取回结果，避免受限沙箱的
+管道 EPERM）：FAIL 或 `--strict` 下的 SKIP 都会让本次构建失败。手动排查时可单独运行。
+
 | # | 检查项 | 失败含义 |
 |---|---|---|
 | 1 | 清单存在且可解析 | 更新链路无从谈起 |
@@ -451,8 +476,9 @@ macOS 上正常，Windows 上 `pathname` 是 `/C:/…`，永不相等 → `main(
 
 | 现象 | 根因 | 处置 |
 |---|---|---|
-| `After Private Key filter, 0 certs were left` | PFX 缺私钥，或云签名器 KSP 未就绪 | 见 §5.4 |
-| 构建卡在 `Submitting digest for signing...` | 等待 PIN / 手机确认 | 开 PIN 缓存并预热（§5.3） |
+| `After Private Key filter, 0 certs were left` | PFX 缺私钥，或云签名器 KSP 未就绪 | 见 §5.4；先跑 `preflight-win-sign.mjs` |
+| 构建卡在 `Submitting digest for signing...` | 等待 PIN / 手机确认 | 开 PIN 缓存并预热（§5.3）；`--warmup` |
+| `preflight` 报「证书存储里没有可用的代码签名证书」 | 未登录 / 证书不在 CurrentUser\My / 无私钥 / 已过期 | 按提示检查登录态与 `HasPrivateKey`，或用 `--sha1` 指定 |
 | `Fatal error: Unable to commit changes`（rcedit） | exe 刚写入被实时防护瞬时独占 | 退避补写 + `--prepackaged` 续跑（§5.7） |
 | `'electron-builder' 不是内部或外部命令` / `npx` 失效 | `node_modules` 跨平台拷贝，`.bin` 无 `.cmd` shim | `node node_modules/electron-builder/cli.js`；长期解法 `npm ci`（§1.1） |
 | `npm run build:win` 报 `Missing script` | 打包脚本只在部分分支存在 | 改用裸 builder，收尾照做（SKILL.md §5.7） |

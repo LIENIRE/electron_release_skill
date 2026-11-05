@@ -147,7 +147,7 @@ electron-builder 构建时自动生成 `latest.yml`（win）/ `latest-mac.yml`�
 路径取自 `build.publish`（或 `build.directories.output` 下的同名文件）。
 mac 的会写进 app 内的 `resources/app-update.yml`。
 
-### 3.2清单结构
+### 3.2 清单结构
 
 ```yaml
 version: 1.1.1
@@ -172,10 +172,12 @@ releaseDate: '2026-09-21T08:39:57.000Z'
 需要把相对文件名改为绝对 URL（安装包在 GitHub、清单在自建服务器的场景）时：
 
 ```js
-const yaml = require('js-yaml');
-const m = yaml.load(fs.readFileSync('dist/latest-mac.yml', 'utf8'));
+// 统一实现：scripts/lib/manifest.mjs（装了项目 js-yaml 就用它，没有则内置解析器）
+import { createCodec } from './scripts/lib/manifest.mjs';
+const { parse, dump } = createCodec([process.cwd()]);
+const m = parse(fs.readFileSync('dist/latest-mac.yml', 'utf8'));
 m.files = m.files.map(f => ({ ...f, url: `https://github.com/OWNER/REPO/releases/download/${TAG}/` + f.url }));
-fs.writeFileSync(out, yaml.dump(m, { lineWidth: -1, noRefs: true }));
+fs.writeFileSync(out, dump(m));
 ```
 
 ### 3.4 清单与产物必须成对发布★
